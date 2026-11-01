@@ -1,0 +1,6 @@
+本项目基于 dsh-pet 0.3.8 定制。
+
+dsh-pet: MIT License, Copyright (c) 2026 PC2005-cloud
+https://github.com/PC2005-cloud/dsh-pet
+
+patches/ 下为对本项目对上游代码的修改（unified diff），不包含上游完整源码。
