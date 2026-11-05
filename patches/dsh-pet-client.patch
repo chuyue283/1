@@ -1,0 +1,108 @@
+--- package/lib/client.js	1985-10-26 16:15:00.000000000 +0800
++++ C:/Users/Chinagay/.dsh/profiles/desktop/node_modules/dsh-pet/lib/client.js	2026-11-08 18:06:43.401302400 +0800
+@@ -1358,6 +1358,7 @@
+ 		leaveTimer = null;
+ 		document.removeEventListener("mousedown", onDocPointerDown, true);
+ 		document.removeEventListener("keydown", onDocKeyDown, true);
++		window.clearInterval(__draftTimer);
+ 		root.remove();
+ 		if (onClose) onClose();
+ 	};
+@@ -1481,7 +1482,23 @@
+ 		input.style.height = "auto";
+ 		input.style.height = Math.max(input.scrollHeight, 22) + "px";
+ 	};
+-	input.addEventListener("input", resizeInput);
++	input.addEventListener("input", () => { input.dataset.dirty = "1"; resizeInput(); });
++	// 语音草稿：voice-chat.py 边说边推，这里实时显示（用户自己打字后就不再覆盖）
++	let __draftLast = "";
++	const __draftTimer = window.setInterval(async () => {
++		if (closed) return;
++		try {
++			const r = await fetch("/dsh-pet-7340/voice-draft");
++			if (!r.ok) return;
++			const j = await r.json();
++			const t = typeof j.text === "string" ? j.text : "";
++			if (t === __draftLast) return;
++			__draftLast = t;
++			if (input.dataset.dirty === "1") return;
++			input.value = t;
++			resizeInput();
++		} catch {}
++	}, 300);
+ 	resizeInput();
+ 	const err = document.createElement("div");
+ 	err.className = "dsh-pet-chat-err";
+@@ -3287,6 +3304,7 @@
+ 											type: "button",
+ 											onClick: removeSel,
+ 											disabled: busy,
++											style: { display: "none" },
+ 											className: "dsh-pet-cfg__btn is-danger is-sm",
+ 											children: t("remove")
+ 										})
+@@ -4006,6 +4024,31 @@
+ 				chatRef.current = null;
+ 			}
+ 		}, []);
++		// 语音草稿：一有识别文字就自动弹出输入框（不用右键菜单）
++		useEffect(() => {
++			try { fetch("/dsh-pet-7340/client-build?b=1800").catch(() => {}); } catch {}
++			let stopped = false;
++			const iv = window.setInterval(async () => {
++				if (stopped || chatRef.current) return;
++				try {
++					const r = await fetch("/dsh-pet-7340/voice-draft");
++					if (!r.ok) return;
++					const j = await r.json();
++					if (!j || typeof j.text !== "string" || j.text === "") return;
++					const hitRect = stageRef.current?.querySelector(".dsh-pet-hit")?.getBoundingClientRect();
++					chatRef.current = mountChatDialog({
++						petId: cfg.id,
++						baseUrl: "/dsh-pet-7340/chat",
++						surface: "web",
++						x: hitRect ? hitRect.right + 6 : window.innerWidth - 256,
++						y: hitRect ? hitRect.top + 6 : 8,
++						onSent: () => {},
++						onClose: () => { chatRef.current = null; }
++					});
++				} catch {}
++			}, 400);
++			return () => { stopped = true; window.clearInterval(iv); };
++		}, [cfg.id]);
+ 		const prevTickRef = useRef(0);
+ 		useEffect(() => {
+ 			if (balanceTick === 0 || balanceTick === prevTickRef.current) return;
+@@ -5815,6 +5858,32 @@
+ 	};
+ }
+ 
++
++//#region 开机问候：等动画播完再说
++// 开机动画是 div.dshba 覆盖层；它消失（或被跳过）之后再让桌宠开口。
++// 这样问候语不会盖在动画上，也不会等到 25 秒兜底才出声。
++(function () {
++  try {
++    var sent = false;
++    var send = function () {
++      if (sent) return;
++      sent = true;
++      try {
++        fetch("/dsh-pet-7340/greet-now", { method: "POST", keepalive: true }).catch(function () {});
++      } catch (e) {}
++    };
++    var done = function () {
++      var el = document.querySelector(".dshba");
++      if (!el) { send(); return true; }
++      if (el.getAttribute("data-state") === "leaving") { send(); return true; }
++      return false;
++    };
++    if (done()) return;
++    var iv = setInterval(function () { if (done()) clearInterval(iv); }, 400);
++    setTimeout(function () { clearInterval(iv); send(); }, 60000);
++  } catch (e) {}
++})();
++//#endregion
+ //#endregion
+ //#region src/client/index.ts
+ window.__ModuleLoader__.load({

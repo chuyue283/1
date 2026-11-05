@@ -1,0 +1,2936 @@
+--- package/lib/index.js	1985-10-26 16:15:00.000000000 +0800
++++ C:/Users/Chinagay/.dsh/profiles/desktop/node_modules/dsh-pet/lib/index.js	2026-11-08 20:55:50.805832900 +0800
+@@ -1,4 +1,4 @@
+-import { createReadStream, existsSync, fstatSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
++import { appendFileSync, createReadStream, existsSync, fstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
+ import { mkdir, readFile, writeFile } from "node:fs/promises";
+ import { homedir } from "node:os";
+ import { dirname, join, normalize, resolve, sep } from "node:path";
+@@ -10,6 +10,268 @@
+ import { createRequire } from "node:module";
+ import { downloadArtifact } from "@electron/get";
+ 
++//#region pet-voice: 给气泡加语音（本地 edge-tts，可独立关闭）
++const PET_VOICE_DIR = join(resolveDshHome(), "dsh-pet", "voice");
++let petVoiceDaemon = null;
++let petVoiceSeq = 0;
++let petVoiceLastAt = 0;
++/** 单句音色覆盖：问候那句用另一个音色，其余仍用 voice.json 的默认音色 */
++const petVoicePending = new Map();
++/** 读 voice.json 里的 greetingVoice（缺省为空 = 用默认音色） */
++/** 本地 Ollama 的"自带生命周期"：
++ *  - DSH 启动时若它没在跑，就由本插件拉起（模型目录指向 D 盘）
++ *  - DSH 退出/插件卸载时，只有"我们拉起的那个"才关掉；外部已开的进程不动
++ */
++let petBgmChild = null;
++/** 读 voice.json 里的 bgm 段（缺省则用内置默认） */
++function petBgmConfig() {
++	try {
++		const b = petVoiceJson().bgm || {};
++		return {
++			enabled: b.enabled !== false,
++			file: typeof b.file === "string" ? b.file : "",
++			start: Number.isFinite(Number(b.start)) ? Number(b.start) : 1,
++			volume: Number.isFinite(Number(b.volume)) ? Number(b.volume) : 28,
++			fadeMs: Number.isFinite(Number(b.fadeMs)) ? Number(b.fadeMs) : 4000
++		};
++	} catch {
++		return { enabled: false, file: "", start: 1, volume: 28, fadeMs: 4000 };
++	}
++}
++/** 提前拉起 BGM 助手（它在内部 sleep，到点才播，所以能精确对齐片尾） */
++function startBgm(leadMs) {
++	const cfg = petBgmConfig();
++	if (!cfg.enabled || cfg.file === "" || !existsSync(cfg.file)) return false;
++	try { if (petBgmChild !== null) { petBgmChild.kill(); petBgmChild = null; } } catch {}
++	const script = join(PET_VOICE_DIR, "bgm.ps1");
++	if (!existsSync(script)) return false;
++	try {
++		petBgmChild = spawn("powershell.exe", [
++			"-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
++			"-File", script,
++			"-Clip", cfg.file,
++			"-Start", String(cfg.start),
++			"-Volume", String(cfg.volume),
++			"-FadeMs", String(cfg.fadeMs),
++			"-LeadMs", String(Math.max(0, Math.round(leadMs)))
++		], { stdio: "ignore", windowsHide: true });
++		petBgmChild.on("exit", () => { petBgmChild = null; });
++		petBgmChild.unref();
++		return true;
++	} catch {
++		return false;
++	}
++}
++let petOllamaChild = null;
++function ollamaEndpoint() {
++	return "http://127.0.0.1:11434/api/tags";
++}
++async function ollamaAlive() {
++	try {
++		const res = await fetch(ollamaEndpoint(), { signal: AbortSignal.timeout(1200) });
++		return res.ok;
++	} catch {
++		return false;
++	}
++}
++function ollamaExe() {
++	const base = process.env.LOCALAPPDATA || join(process.env.USERPROFILE || "", "AppData", "Local");
++	return join(base, "Programs", "Ollama", "ollama.exe");
++}
++async function ensureOllamaServer() {
++	try {
++		if (petOllamaChild !== null) return; // 已经在拉起了，别重复 spawn
++		if (await ollamaAlive()) {
++			console.log("[dsh-pet] 本地模型服务已在运行（外部启动），不做接管");
++			return;
++		}
++		const exe = ollamaExe();
++		if (!existsSync(exe)) {
++			console.warn("[dsh-pet] 找不到 ollama.exe：" + exe);
++			return;
++		}
++		petOllamaChild = spawn(exe, ["serve"], {
++			env: {
++				...process.env,
++				OLLAMA_MODELS: (() => { try { return join(realpathSync(PET_VOICE_DIR), "models") } catch { return join(PET_VOICE_DIR, "models") } })(),
++				OLLAMA_KEEP_ALIVE: "-1"
++			},
++			stdio: "ignore",
++			windowsHide: true
++		});
++		petOllamaChild.on("exit", () => { petOllamaChild = null; });
++		petOllamaChild.unref();
++		console.log("[dsh-pet] 已随 DSH 启动本地模型服务 pid=" + String(petOllamaChild.pid));
++	} catch (e) {
++		console.warn("[dsh-pet] 启动本地模型服务失败：" + (e instanceof Error ? e.message : String(e)));
++	}
++}
++function shutdownOllamaServer() {
++	const child = petOllamaChild;
++	petOllamaChild = null;
++	if (child && child.pid !== void 0) {
++		try {
++			child.kill();
++			console.log("[dsh-pet] 已随 DSH 关闭本地模型服务 pid=" + String(child.pid));
++		} catch {}
++	}
++}
++/** 读 voice.json 的 greetingSpeed（缺省 1 = 原速；0.8 = 慵懒） */
++/** 固定的问候文案：配置了就只说这句（模型只负责预热缓存，不决定措辞） */
++function petGreetingText() {
++	try {
++		const v = petVoiceJson().greetingText;
++		return typeof v === "string" && v.trim() !== "" ? v.trim() : "";
++	} catch {
++		return "";
++	}
++}
++function petGreetingSpeed() {
++	try {
++		const v = Number(petVoiceJson().greetingSpeed);
++		return Number.isFinite(v) && v > 0 ? Math.min(1.5, Math.max(0.5, v)) : 1;
++	} catch {
++		return 1;
++	}
++}
++function petGreetingVoice() {
++	try {
++		const v = petVoiceJson().greetingVoice;
++		return typeof v === "string" ? v : "";
++	} catch {
++		return "";
++	}
++}
++/** 读 voice.json（允许行注释与块注释，失败返回空对象） */
++function petVoiceJson() {
++	try {
++		const raw = readFileSync(join(PET_VOICE_DIR, "voice.json"), "utf8")
++			.replace(/^\s*\/\/.*$/gm, "")
++			.replace(/\/\*[\s\S]*?\*\//g, "");
++		return JSON.parse(raw);
++	} catch {
++		return {};
++	}
++}
++function petVoiceEnabled() {
++	try {
++		return petVoiceJson().enabled !== false;
++	} catch {
++		return true;
++	}
++}
++function petVoiceDelayMs() {
++	try {
++		const raw = petVoiceJson().bubbleDelayMs;
++		if (raw === null || raw === void 0) return 1100;
++		const n = Number(raw);
++		return Number.isFinite(n) && n >= 0 ? n : 1100;
++	} catch {
++		return 1100;
++	}
++}
++/** 把"要说出口的文本"清洗干净：
++ *  - 去掉表情包标记 [图:名称] / [配图]（否则 Fish 会把标记本身念出来，出现怪声）
++ *  - 去掉所有方括号标签（Fish 会当情绪标签处理，可能触发笑/叹气等怪音）
++ *  - 去掉模型偶尔带上的"角色名："前缀
++ *  - 只剩标点/空白时返回空串（调用方据此跳过发声）
++ */
++function petSpeechText(text) {
++	let t = String(text)
++		// 表情包标记：整个丢弃，不念图名（括号可能残缺，左右都设为可选）
++		.replace(/[\[【]?\s*图\s*[:：]\s*[^\]】\n]*[\]】]?/g, " ")
++		.replace(/[\[【]\s*配图\s*[\]】]/g, "")
++		.replace(/[\[【][^\]】]{0,24}[\]】]/g, "")
++		// 残留的孤立括号也去掉，否则 Fish 会把它们当标签
++		.replace(/[\[\]【】]/g, " ")
++		// 模型偶尔只吐半截标签（说> / </想> / 想>），这里统一清掉
++		.replace(/<\/?\s*(说|想)\s*>/g, " ")
++		.replace(/&lt;\/?\s*(说|想)\s*&gt;/gi, " ")
++		.replace(/&[a-z]+;/gi, " ")
++		.replace(/(^|\s)(说|想)>\s*/g, "$1")
++		.replace(/<\/\s*(说|想)\s*>/g, " ")
++		.replace(/^[\s"'「『]+/, "")
++		.replace(/[\s"'」』]+$/, "");
++	const m = t.match(/^([^\s：:，。！？]{1,10})[：:]\s*/);
++	if (m && /女仆|蓝毛|小女/.test(m[1])) t = t.slice(m[0].length);
++	t = t.replace(/\s+/g, " ").trim();
++	if (!/[\u4e00-\u9fa5A-Za-z0-9]/.test(t)) return "";
++	return t;
++}
++let petPersonaVoice = null; // 当前人格音色（鲸娘时由对话流程设置）
++/** 语音输入的实时草稿（voice-chat.py 边识别边推过来，气泡里显示；发出去后清空） */
++let petVoiceDraft = "";
++// speakPetLine 在模块作用域，够不到 apply 里的 petPersonaState()/petLog，
++// 所以这里放一份"当前人格"的模块级镜像，由对话/切换流程随时更新。
++let petWhoCache = "xiaoyu";
++let petPersonaVoiceCache = null;
++function speakPetLine(text, voiceOverride) {
++	try {
++		if (typeof text !== "string") return;
++		if (!petVoiceEnabled()) return;
++		let __opts = typeof voiceOverride === "object" && voiceOverride !== null ? voiceOverride : null;
++		// 音色以模块级镜像为准（由对话/切换流程维护），不依赖可能过期的 petPersonaVoice
++		const __personaVoiceNow = petPersonaVoiceCache || (petWhoCache === "jingniang" ? PET_JINGNIANG_VOICE : null);
++		if (__personaVoiceNow && !(__opts && __opts.voice)) __opts = Object.assign({}, __opts || {}, { voice: __personaVoiceNow });
++		if (__opts && __opts.silent) return;
++		const now = Date.now();
++		// 流式分句时会连续发多句，用 force 绕过 900ms 去抖
++		if (!(__opts && __opts.force) && now - petVoiceLastAt < 900) return;
++		petVoiceLastAt = now;
++		// 语音守护进程（Python 版）：读 stdin 的文件路径 → 合成 → 播放
++		try {
++			const __d = new Date(), __p = (x) => String(x).padStart(2, "0");
++			const __line = "[" + __p(__d.getHours()) + ":" + __p(__d.getMinutes()) + ":" + __p(__d.getSeconds())
++				+ "." + String(__d.getMilliseconds()).padStart(3, "0") + "] 语音: "
++				+ String((__opts && __opts.voice) || "默认") + " | 人格=" + petWhoCache + " | " + String(text).slice(0, 16) + String.fromCharCode(10);
++			appendFileSync(join(PET_VOICE_DIR, "corpus", "host.log"), __line, "utf8");
++		} catch {}
++		const script = join(PET_VOICE_DIR, "voice_daemon.py");
++		if (!existsSync(script)) return;
++		const PY_EXE = "C:/Users/Chinagay/.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/python/python.exe";
++		if (petVoiceDaemon === null || petVoiceDaemon.exitCode !== null) {
++			petVoiceDaemon = spawn(PY_EXE, ["-X", "utf8", script], {
++				stdio: [
++					"pipe",
++					"ignore",
++					"ignore"
++				],
++				windowsHide: true
++			});
++			petVoiceDaemon.on("error", () => {
++				petVoiceDaemon = null;
++			});
++			petVoiceDaemon.on("exit", () => {
++				petVoiceDaemon = null;
++			});
++			petVoiceDaemon.unref();
++			petVoiceDaemon.stdin.unref?.();
++		}
++		const inbox = join(PET_VOICE_DIR, "inbox");
++		mkdirSync(inbox, { recursive: true });
++		// 只有"真的能念的文字"才发声；纯标记（如 [图:xxx]）直接跳过
++		const speechText = petSpeechText(text);
++		if (speechText === "") return;
++		text = speechText;
++		const file = join(inbox, "line-" + String(++petVoiceSeq) + ".txt");
++		// 有单句音色覆盖时写 JSON，daemon 会按 JSON 解析；否则维持纯文本（老行为）
++		const opts = typeof voiceOverride === "string"
++			? { voice: voiceOverride }
++			: (voiceOverride && typeof voiceOverride === "object" ? voiceOverride : null);
++		const payload = opts ? JSON.stringify({ text, ...opts }) : text;
++		writeFileSync(file, payload, "utf8");
++		petVoiceDaemon.stdin.write(file + "\n");
++	} catch {}
++}
++// 预热：插件加载 6 秒后拉起火声进程并让它自己焐热，第一句话就不用等冷启动。
++try {
++	setTimeout(() => {
++		try {
++			if (petVoiceEnabled()) speakPetLine("");
++		} catch {}
++	}, 6e3).unref?.();
++} catch {}
++//#endregion
+ //#region src/host/balance/internal.ts
+ /**
+ * 余额查询的**内部工具**（host 侧）：网络策略 + 响应校验 + 金额处理。
+@@ -480,7 +742,18 @@
+ 		out.push(m);
+ 	};
+ 	push(preferred);
+-	push(currentModel(ctx));
++	// 只允许回落到"本地"模型；DSH 当前选的可能是云端（deepseek-flash），
++	// 那会在本地失败时悄悄花掉用户额度（2026-11-01 加的保护）
++	const cur = currentModel(ctx);
++	const localOnly = (() => {
++		try {
++			const v = JSON.parse(readFileSync(join(PET_VOICE_DIR, "voice.json"), "utf8").replace(/^\s*\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, ""));
++			return v.allowCloudFallback !== true;
++		} catch {
++			return true;
++		}
++	})();
++	if (cur && (cur.provider === "ollama-local" || cur.provider === "siliconflow" || !localOnly)) push(cur);
+ 	return out;
+ }
+ function modelLabel(m) {
+@@ -500,7 +773,7 @@
+ function userTextWithMeme(meme) {
+ 	return "随便说一句日常碎碎念，一句就好，20 字以内。\n这次会配一张表情包一起显示，图的内容是：" + meme.name + "（" + meme.desc + "）。\n请让这句话和这张图的情绪/场景自然契合，像是配合画面说出来的；不要描述画面本身。";
+ }
+-async function generateWhisper(ctx, system, meme, preferred) {
++async function generateWhisper(ctx, system, meme, preferred, userText, temperature) {
+ 	const candidates = modelCandidates(ctx, preferred);
+ 	if (candidates.length === 0) return {
+ 		ok: false,
+@@ -519,7 +792,7 @@
+ 		message: noTextReason(void 0)
+ 	};
+ 	for (const [i, sel] of candidates.entries()) {
+-		const result = await generateWith$1(ctx, llm, sel, system, meme);
++		const result = await generateWith$1(ctx, llm, sel, system, meme, userText, temperature);
+ 		if (result.ok) return result;
+ 		last = result;
+ 		if (i + 1 < candidates.length) console.warn(`dsh-pet: 碎碎念用 ${modelLabel(sel)} 生成失败（${result.message ?? result.reason}），回落到 ${modelLabel(candidates[i + 1])}`);
+@@ -527,7 +800,7 @@
+ 	return last;
+ }
+ /** 用**一个**确定的 provider/model 跑一次生成（候选链的一环；失败原样返回结构化原因，不吞） */
+-async function generateWith$1(ctx, llm, sel, system, meme) {
++async function generateWith$1(ctx, llm, sel, system, meme, userText, temperature) {
+ 	const deadline = AbortSignal.timeout(TIMEOUT_MS$1);
+ 	const supportsOff = await supportsReasoningOff(ctx, sel.provider, sel.model);
+ 	const options = {
+@@ -537,18 +810,31 @@
+ 		messages: [createUserMessage({
+ 			content: [{
+ 				type: "text",
+-				text: meme ? userTextWithMeme(meme) : USER_TEXT
++				text: typeof userText === "string" && userText !== "" ? userText : (meme ? userTextWithMeme(meme) : USER_TEXT)
+ 			}],
+ 			source: { kind: "user" }
+ 		})],
+ 		system,
+-		temperature: 1,
++		temperature: typeof temperature === "number" ? temperature : 0.8,
+ 		...supportsOff ? { reasoningEffort: ReasoningEffortId("off") } : {},
+ 		signal: deadline
+ 	};
+ 	const assembler = new BlockAssembler();
++	let __lastText = "";
+ 	try {
+-		for await (const chunk of llm.stream(options)) assembler.push(chunk);
++		for await (const chunk of llm.stream(options)) {
++			assembler.push(chunk);
++			// 流式回调：把"到目前为止的完整文本"交给上层，用来提前把第一句送去合成
++			if (typeof onProgress === "function") {
++				try {
++					const sofar = assembler.blocks().filter((b) => b.type === "text").map((b) => "text" in b ? b.text : "").join("");
++					if (sofar.length > __lastText.length) {
++						__lastText = sofar;
++						onProgress(sofar);
++					}
++				} catch {}
++			}
++		}
+ 	} catch (e) {
+ 		return {
+ 			ok: false,
+@@ -642,7 +928,7 @@
+ function imageInstruction(pool) {
+ 	return "\n\n[配图] 回复结尾可选附一张表情包给用户看，从下列清单里挑最贴合当前语境的：\n" + memeCatalog(pool) + "\n挑中就在回复最后另起一行写 [图:名称]（名称原样照抄）；没有合适的就完全不要写这个标记。";
+ }
+-async function generateChat(ctx, system, history, userText, pool = [], preferred) {
++async function generateChat(ctx, system, history, userText, pool = [], preferred, onProgress) {
+ 	const candidates = modelCandidates(ctx, preferred);
+ 	if (candidates.length === 0) return {
+ 		ok: false,
+@@ -661,7 +947,7 @@
+ 		message: noTextReason(void 0)
+ 	};
+ 	for (const [i, sel] of candidates.entries()) {
+-		const result = await generateWith(ctx, llm, sel, system, history, userText, pool);
++		const result = await generateWith(ctx, llm, sel, system, history, userText, pool, onProgress);
+ 		if (result.ok) return result;
+ 		last = result;
+ 		if (i + 1 < candidates.length) console.warn(`dsh-pet: 对话用 ${modelLabel(sel)} 生成失败（${result.message ?? result.reason}），回落到 ${modelLabel(candidates[i + 1])}`);
+@@ -669,7 +955,7 @@
+ 	return last;
+ }
+ /** 用**一个**确定的 provider/model 跑一次对话生成（候选链的一环；失败原样返回结构化原因，不吞） */
+-async function generateWith(ctx, llm, sel, system, history, userText, pool) {
++async function generateWith(ctx, llm, sel, system, history, userText, pool, onProgress) {
+ 	const historyMessages = history.map((m) => m.role === "user" ? createUserMessage({
+ 		content: [{
+ 			type: "text",
+@@ -706,8 +992,21 @@
+ 		signal: deadline
+ 	};
+ 	const assembler = new BlockAssembler();
++	let __seenLen = 0;
+ 	try {
+-		for await (const chunk of llm.stream(options)) assembler.push(chunk);
++		for await (const chunk of llm.stream(options)) {
++			assembler.push(chunk);
++			// 把"已经写出来的部分"实时交回去，让桌宠边写边说（原来这里漏了，导致永远 0 块）
++			if (typeof onProgress === "function") {
++				try {
++					const __cur = assembler.blocks().filter((b) => b.type === "text").map((b) => "text" in b ? b.text : "").join("");
++					if (__cur.length > __seenLen) {
++						__seenLen = __cur.length;
++						onProgress(__cur);
++					}
++				} catch {}
++			}
++		}
+ 	} catch (e) {
+ 		return {
+ 			ok: false,
+@@ -1268,6 +1567,23 @@
+ 	mkdirSync(dirname(paths.userFile), { recursive: true });
+ 	writeFileSync(paths.userFile, raw, "utf8");
+ }
++	/** 主人这句话是不是问句（决定带几轮历史） */
++	function petIsQuestionText(text) {
++		const t = String(text || "").trim();
++		if (t === "") return false;
++		if (/[?？]\s*$/.test(t)) return true;
++		if (/(吗|呢|么)\s*[。.!！~～]?\s*$/.test(t)) return true;
++		return /(什么|怎么|为什么|为啥|哪|谁|几点|多少|多久|多远|是不是|能不能|会不会|要不要|有没有|好不好|行不行|对不对|可以不|好吗|行吗)/.test(t);
++	}
++
++	/** 动态历史轮数：问句 0 轮，陈述 1 轮（实测：问句带历史容易接话跑偏） */
++	function petHistoryRounds(confRounds, text) {
++		const base = Number(confRounds);
++		const fallback = Number.isFinite(base) && base > 0 ? base : 2;
++		if (petIsQuestionText(text)) return 0;
++		return Math.min(fallback, 1);
++	}
++
+ function sliceMemoryRounds(messages, rounds) {
+ 	return rounds > 0 ? messages.slice(-Math.floor(rounds) * 2) : [];
+ }
+@@ -2736,6 +3052,20 @@
+ 	}
+ 	/** 写一只宠物的叶子（宠物条目不存在则自动建立，**所有槽位一起建好**，形状恒定） */
+ 	writePet(petId, leaf, data) {
++		if (leaf === "say" && data && typeof data.text === "string" && petVoiceEnabled()) {
++			const ov = petVoicePending.get(petId);
++			if (ov !== void 0) petVoicePending.delete(petId);
++			speakPetLine(data.text, ov);
++			const delay = petVoiceDelayMs();
++			if (delay > 0) {
++				// 先出声、后显字：文字气泡押后一点，等语音起来
++				setTimeout(() => this.writeSayNow(petId, leaf, data), delay);
++				return;
++			}
++		}
++		this.writeSayNow(petId, leaf, data);
++	}
++	writeSayNow(petId, leaf, data) {
+ 		let entry = this.pets.get(petId);
+ 		if (!entry) {
+ 			entry = {
+@@ -4096,6 +4426,1616 @@
+ 	*  供 POST /chat（动作端点）与 /chat 命令共用同一条路径（锁内读写，防两端交错写盘）。
+ 	*  配图（chatImageEnabled 开启时）：把表情包清单交给模型按语境选一张，命中池内才随回复写回。
+ 	*  成功**带回回复文本**（与同时写进叶子的那份完全相同）——调用方拿到就不必再拉一拍 /state。 */
++	/** 开机问候：让模型说一句"欢迎回来"之类的短句。
++	*  两个作用：① 宠物开口的第一句 ② 把"人设前缀"填进模型缓存，
++	*  用户第一次点碎碎念时就不用再等一遍——成本只有一次生成。
++	*  低温度 + 短指令压住长度；单句音色由 petVoicePending 覆盖。 */
++	const GREETING_USER_TEXT = "只输出一句问候语，意思接近「这里是深海女仆工坊，欢迎回来」。硬性要求：不要出现任何角色名或自称（例如蓝毛小女仆），不要带冒号，不要带引号，不要提问，不超过 15 个字。";
++	/** 已生成、待播放的问候：等开机动画片尾（或兜底定时器）才真正开口。 */
++	let petGreetingReady = null;
++	let petGreetingTask = null;
++	let petGreetingSpoken = false;
++	const publishGreeting = async (petId, voice) => {
++		const cfg = readAllConfig(configPaths);
++		// 文案固定时，先把这句 TTS 预合成好、并立刻标记为"可播"——
++		// 不等模型生成，这样片尾信号一到就能立刻出声（模型只负责预热缓存）
++		const fixedEarly = petGreetingText();
++		if (fixedEarly !== "" && petGreetingReady === null) {
++			petGreetingReady = { petId, voice, text: fixedEarly };
++			try { speakPetLine(fixedEarly, { voice, greeting: true, prewarm: true, speed: petGreetingSpeed() }); } catch {}
++		}
++		const found = findPetInstance(cfg, petId);
++		if (!found) return { ok: false, reason: "unknown-pet" };
++		const system = petSystemPrompt(found);
++		const result = await generateWhisper(ctx, system, void 0, configuredModel(found.conf, "whisperModel"), GREETING_USER_TEXT, 0.3);
++		if (!result.ok) {
++			console.warn("[dsh-pet] 开机问候生成失败 reason=" + result.reason + (result.message ? " " + result.message : ""));
++			return result;
++		}
++		// 清洗：模型偶尔会加「名字：」前缀或引号，这里统一去掉
++		const petName = String(found.pet.name ?? "");
++		const cleaned = String(result.text)
++			.replace(/^[「『"'\s]+/, "")
++			.replace(/[」』"'\s]+$/, "")
++			.replace(/^[^：:]{1,10}[：:]\s*/, "")
++			.split(petName).join("")
++			.trim();
++		const fixed = petGreetingText();
++		if (petGreetingReady === null) petGreetingReady = { petId, voice, text: fixed || cleaned || result.text };
++		// 预合成音频但不播：片尾那一刻命中缓存，几乎瞬时出声
++		try { speakPetLine(result.text, { voice, greeting: true, prewarm: true, speed: petGreetingSpeed() }); } catch {}
++		return { ok: true, text: result.text };
++	};
++	/** 真正开口：写 say（气泡）+ 触发语音；只会成功一次。 */
++	const speakGreeting = () => {
++		try { writeFileSync(join(PET_VOICE_DIR, "corpus", "greet-hits.log"), new Date().toISOString() + " speak ready=" + String(petGreetingReady !== null) + "\n", { encoding: "utf8", flag: "a" }); } catch {}
++		if (petGreetingSpoken) return false;
++		const g = petGreetingReady;
++		if (!g) return false;
++		petGreetingSpoken = true;
++		petGreetingReady = null;
++		try { petVoicePending.set(g.petId, { voice: g.voice, greeting: true, speed: petGreetingSpeed() }); } catch {}
++		state.writePet(g.petId, "say", { text: g.text });
++		return true;
++	};
++	/** 同一开机周期只问候一次：30 分钟内不重复，避免调试时反复刷屏。 */
++	const GREETING_STAMP = join(PET_VOICE_DIR, "last-greeting.txt");
++	const shouldGreet = () => {
++		try {
++			const last = Number(readFileSync(GREETING_STAMP, "utf8"));
++			if (Number.isFinite(last) && Date.now() - last < 18e5) return false;
++		} catch {}
++		return true;
++	};
++	const markGreeted = () => {
++		try {
++			mkdirSync(dirname(GREETING_STAMP), { recursive: true });
++			writeFileSync(GREETING_STAMP, String(Date.now()), "utf8");
++		} catch {}
++	};
++	// 启动 8 秒后触发（等宿主与宠物状态稳定）
++	try {
++		setTimeout(() => {
++			try {
++				// 每次宿主启动都要问候（去重只用于同一进程内的重复触发）
++				if (!petVoiceEnabled()) return;
++				if (petGreetingSpoken) return;
++				// readAllConfig 是按条目组织的 {entry:{pets:[...]}}，取桌面可见的第一只更稳
++				const list = desktopPetList();
++				const first = list.length > 0 ? list[0].id : void 0;
++				if (!first) return;
++				markGreeted();
++				petLog("插件已加载 · 构建 2026-11-08-2100");
++				// 3 秒就开跑：最短片子 8 秒，必须赶在片尾前搞定
++				petGreetingTask = publishGreeting(first, petGreetingVoice()).catch(() => null);
++				// 预热鲸娘人设：让 Ollama 先把这段前缀的 KV 缓存建好，
++				// 之后每次切鲸娘都命中缓存，不用再"读一遍人设"（实测省 20–30 秒）
++				setTimeout(() => {
++					try {
++						const __f2 = findPetInstance(readAllConfig(configPaths), first);
++						const __b2 = configuredModel(__f2?.conf, "chatModel");
++						const __jm2 = { provider: (__b2 && __b2.provider) || "ollama-local", model: PET_JINGNIANG_MODEL };
++						generateChat(ctx, PET_JINGNIANG_PROMPT, [], "。", [], __jm2).catch(() => null);
++						petLog("鲸娘人设已预热");
++					} catch {}
++				}, 3000).unref?.();
++				// 兜底：页面没接动画（或动画被跳过/失败）时，25 秒后自己开口
++				setTimeout(() => {
++					try { speakGreeting(); } catch {}
++				}, 25e3).unref?.();
++			} catch {}
++		}, 1e3).unref?.();
++	} catch {}
++	// ===================== 对话记忆（阶段一） =====================
++	// 全量存档：每轮对话写一行 JSON 到 corpus/memory.jsonl
++	// 检索：先查"热记忆"（最近 N 天），没命中再查全量；中文用二元组（2-gram）匹配
++	const PET_MEMORY_FILE = join(PET_VOICE_DIR, "corpus", "memory.jsonl");
++	const MEM_STOP = new Set(["的", "了", "是", "在", "我", "你", "他", "她", "它", "们", "这", "那", "就", "都", "也", "和", "与", "吗", "呢", "吧", "啊", "呀", "哦", "嗯", "哈", "什么", "怎么", "为什么", "可以", "一个", "没有", "不是", "现在", "今天", "明天", "昨天", "时候", "感觉", "真的", "还是", "但是", "因为", "所以", "如果", "然后", "已经", "有点", "一点", "自己", "知道", "觉得", "好像", "应该"]);
++	let memCache = { mtime: 0, rows: [] };
++	/** 读全量记忆（带 mtime 缓存，避免每轮重复解析） */
++	function memRows() {
++		try {
++			const st = statSync(PET_MEMORY_FILE);
++			if (st.mtimeMs === memCache.mtime) return memCache.rows;
++			const raw = readFileSync(PET_MEMORY_FILE, "utf8");
++			const rows = [];
++			for (const line of raw.split("\n")) {
++				if (!line.trim()) continue;
++				try { const o = JSON.parse(line); if (o && o.user) rows.push(o); } catch {}
++			}
++			memCache = { mtime: st.mtimeMs, rows };
++			return rows;
++		} catch {
++			return [];
++		}
++	}
++	/** 中文按二元组切、英文按单词切，去掉停用词 */
++	function memTokens(text) {
++		const big = new Set();
++		const uni = new Set();
++		const t = String(text || "").toLowerCase();
++		for (const w of (t.match(/[a-z0-9_]+/g) || [])) if (w.length > 1) big.add(w);
++		for (const seg of t.replace(/[^\u4e00-\u9fa5]/g, " ").split(/\s+/)) {
++			if (!seg) continue;
++			// 单字：兜住"腰疼"配"腰有点疼"这类没有任何共同二元组的情况（权重降低）
++			for (const ch of seg) if (!MEM_STOP.has(ch)) uni.add(ch);
++			for (let i = 0; i + 1 < seg.length; i++) {
++				const g = seg.slice(i, i + 2);
++				if (!MEM_STOP.has(g)) big.add(g);
++			}
++		}
++		return { big, uni };
++	}
++	function memEntryTokens(row) {
++		if (!row.__tk) {
++			const tk = memTokens(String(row.user) + " " + String(row.say || ""));
++			try { Object.defineProperty(row, "__tk", { value: tk, enumerable: false }); } catch { row.__tk = tk; }
++		}
++		return row.__tk;
++	}
++	/** 两层检索：热记忆 → 全局；返回 { hits, source } */
++	function memSearch(query, opts = {}) {
++		const __mw = petPersonaState().who;
++		const rows = memRows().filter((r) => (__mw === "jingniang" ? true : r.who !== "jingniang"));
++		if (rows.length === 0) return { hits: [], source: "none" };
++		const hotDays = Number.isFinite(opts.hotDays) ? opts.hotDays : 3;
++		const hotTopK = Number.isFinite(opts.hotTopK) ? opts.hotTopK : 2;
++		const globalTopK = Number.isFinite(opts.globalTopK) ? opts.globalTopK : 3;
++		const minScore = Number.isFinite(opts.minScore) ? opts.minScore : 0.5;
++		const q = memTokens(query);
++		if (q.size === 0) return { hits: [], source: "none" };
++		// IDF：统计每个 token 出现在多少条记忆里
++		const df = new Map();
++		for (const row of rows) {
++			const tk = memEntryTokens(row);
++			for (const t of tk.big) df.set(t, (df.get(t) || 0) + 1);
++			for (const t of tk.uni) df.set("u:" + t, (df.get("u:" + t) || 0) + 1);
++		}
++		const N = rows.length;
++		const idf = (t) => Math.log((N + 1) / ((df.get(t) || 0) + 1)) + 1;
++		const now = Date.now();
++		const hotCut = now - hotDays * 864e5;
++		const scoreOf = (row) => {
++			const et = memEntryTokens(row);
++			let bigHits = 0;
++			let uniHits = 0;
++			let sum = 0;
++			for (const t of q.big) if (et.big.has(t)) { bigHits++; sum += idf(t); }
++			for (const t of q.uni) {
++				// 太常见的字（全库一半以上记忆都有）不参与打分，避免"今天"命中所??有
++				if ((df.get("u:" + t) || 0) / N > 0.45) continue;
++				if (et.uni.has(t)) { uniHits++; sum += idf("u:" + t) * 0.3; }
++			}
++			// 必须至少有一个二元组命中；或者有 2 个以上有效单字（短语查询如"猫"放宽到 1 个）
++			const uniqTokens = q.big.size + q.uni.size;
++			const ok = bigHits > 0 || (uniqTokens <= 2 ? uniHits >= 1 : uniHits >= 2);
++			if (!ok || sum <= 0) return 0;
++			const ts = Date.parse(row.ts) || 0;
++			const ageDays = (now - ts) / 864e5;
++			const decay = ageDays <= hotDays ? 1 : (ageDays <= 30 ? 0.7 : 0.45);
++			return { raw: sum, rank: sum * decay };
++		};
++		const scored = [];
++		for (const row of rows) {
++			const sc = scoreOf(row);
++			if (!sc || sc.raw < minScore) continue;
++			scored.push({ row, ...sc });
++		}
++		if (scored.length === 0) return { hits: [], source: "none" };
++		// 第一层：热记忆
++		const hot = scored.filter((x) => (Date.parse(x.row.ts) || 0) >= hotCut).sort((a, b) => b.rank - a.rank).slice(0, hotTopK);
++		if (hot.length > 0) return { hits: hot.map((x) => x.row), source: "hot" };
++		// 第二层：全局
++		const global = scored.sort((a, b) => b.rank - a.rank).slice(0, globalTopK);
++		return { hits: global.map((x) => x.row), source: "global" };
++	}
++	/** 拼成给模型看的记忆块 + 输出格式要求 */
++	// ---------------- 向量记忆（语义检索） ----------------
++	// 用本地 Ollama 的 nomic-embed-text 给每段记忆算向量，
++	// 检索时按余弦相似度找"意思相近"的记忆，弥补关键词匹配的不足。
++	// 任何一步失败都静默退回关键词检索，不影响原有功能。
++	const PET_VEC_FILE = join(PET_VOICE_DIR, "corpus", "memory-vectors.jsonl");
++	const PET_EMBED_MODEL = "bge-m3";
++	let vecCache = { mtime: 0, map: new Map() };
++
++	function memVecRows() {
++		try {
++			const st = statSync(PET_VEC_FILE);
++			if (st.mtimeMs === vecCache.mtime) return vecCache.map;
++			const raw = readFileSync(PET_VEC_FILE, "utf8");
++			const map = new Map();
++			for (const line of raw.split("\n")) {
++				if (!line.trim()) continue;
++				try {
++					const o = JSON.parse(line);
++					if (o && o.ts && Array.isArray(o.v) && o.v.length > 0) map.set(o.ts, o.v);
++				} catch {}
++			}
++			vecCache = { mtime: st.mtimeMs, map };
++			return map;
++		} catch {
++			return vecCache.map;
++		}
++	}
++
++	async function petEmbed(text) {
++		const t = String(text || "").slice(0, 300);
++		if (!t.trim()) return null;
++		try {
++			const ctrl = new AbortController();
++			const timer = setTimeout(() => ctrl.abort(), 4000);
++			const r = await fetch("http://127.0.0.1:11434/api/embeddings", {
++				method: "POST",
++				headers: { "content-type": "application/json" },
++				body: JSON.stringify({ model: PET_EMBED_MODEL, prompt: t }),
++				signal: ctrl.signal,
++			});
++			clearTimeout(timer);
++			if (!r.ok) return null;
++			const j = await r.json();
++			const v = j && j.embedding;
++			return Array.isArray(v) && v.length > 0 ? v : null;
++		} catch {
++			return null;
++		}
++	}
++
++	function cosine(a, b) {
++		if (!a || !b || a.length !== b.length) return -1;
++		let dot = 0, na = 0, nb = 0;
++		for (let i = 0; i < a.length; i++) {
++			dot += a[i] * b[i];
++			na += a[i] * a[i];
++			nb += b[i] * b[i];
++		}
++		if (na === 0 || nb === 0) return -1;
++		return dot / (Math.sqrt(na) * Math.sqrt(nb));
++	}
++
++	// 补算缺失的向量（后台跑，一次一小批，别把 CPU 占满）
++	let vecBuilding = false;
++	async function petBuildVectors(limit = 20) {
++		if (vecBuilding) return;
++		vecBuilding = true;
++		try {
++			const rows = memRows();
++			if (rows.length === 0) return;
++			const map = memVecRows();
++			const todo = rows.filter((r) => r.user && !map.has(r.ts)).slice(-limit);
++			if (todo.length === 0) return;
++			mkdirSync(join(PET_VOICE_DIR, "corpus"), { recursive: true });
++			for (const r of todo) {
++				const text = [r.user, r.say].filter(Boolean).join(" / ");
++				const v = await petEmbed(text);
++				if (!v) break;
++				appendFileSync(PET_VEC_FILE, JSON.stringify({ ts: r.ts, v }) + "\n", "utf8");
++				vecCache = { mtime: 0, map: new Map() };
++			}
++		} catch {}
++		finally { vecBuilding = false; }
++	}
++
++	async function memSearchVector(query, opts = {}) {
++		const rows = memRows();
++		if (rows.length === 0) return [];
++		const minCos = Number.isFinite(opts.minCos) ? opts.minCos : 0.62;
++		const topK = Number.isFinite(opts.globalTopK) ? opts.globalTopK : 3;
++		const qv = await petEmbed(query);
++		if (!qv) return [];
++		const map = memVecRows();
++		const all = [];
++		for (const row of rows) {
++			const v = map.get(row.ts);
++			if (!v) continue;
++			all.push({ row, c: cosine(qv, v) });
++		}
++		if (all.length === 0) return [];
++		// 自适应阈值：跟"中位数"比，明显高的才算命中（避免整体相似度偏高时全中）
++		const cs = all.map((x) => x.c).sort((a, b) => a - b);
++		const median = cs[Math.floor(cs.length / 2)];
++		const lift = Number.isFinite(opts.lift) ? opts.lift : 0.16;
++		const scored = all.filter((x) => x.c >= Math.max(minCos, median + lift));
++		scored.sort((a, b) => b.c - a.c);
++		return scored.slice(0, topK).map((x) => x.row);
++	}
++
++	// 向量 + 关键词 合并成提示块（格式与 memPromptBlock 保持一致）
++	async function memPromptBlockVector(query, opts = {}) {
++		const base = memPromptBlock(query, opts);
++		try {
++			const vecHits = await memSearchVector(query, opts);
++			if (vecHits.length === 0) return base;
++			const isQuestion = (t) => /[?？]\s*$|(?:吗|呢|么)\s*$/.test(t)
++				|| /(多少|什么|啥|谁|哪|几点|怎么|为什么|能不能|是不是|有没有|好不好|行不行|对不对|要不要)/.test(t);
++			const maxChars = Number.isFinite(opts.maxChars) ? opts.maxChars : 300;
++			const seen = new Set();
++			let used = base.prompt.length;
++			const extra = [];
++			for (const row of vecHits) {
++				const u = String(row.user || "").trim();
++				if (u === "" || isQuestion(u)) continue;
++				if (base.prompt.includes(u.slice(0, 12))) continue;
++				const d = String(row.ts || "").slice(5, 10);
++				const item = "- " + d + " 主人说过：" + u.slice(0, 60);
++				if (used + item.length > maxChars + 200) break;
++				if (seen.has(item)) continue;
++				seen.add(item);
++				extra.push(item);
++				used += item.length;
++			}
++			if (extra.length === 0) return base;
++			return {
++				prompt: base.prompt + "\n" + extra.join("\n"),
++				hits: base.hits.concat(vecHits),
++				source: base.source + "+vec",
++			};
++		} catch {
++			return base;
++		}
++	}
++
++	function memPromptBlock(query, opts = {}) {
++		const { hits, source } = memSearch(query, opts);
++		const maxChars = Number.isFinite(opts.maxChars) ? opts.maxChars : 300;
++		const lines = [];
++		let used = 0;
++		// 只注入"陈述"，不注入"提问"：把主人的问题当事实塞进去，
++		// 模型会误以为他早就回答过（"电话号码已经说了"就是这么来的）
++		const isQuestion = (t) => /[?？]\s*$|(?:吗|呢|么)\s*$/.test(t) || /(多少|什么|啥|谁|哪|几点|怎么|为什么|能不能|是不是|有没有|好不好|行不行|对不对|要不要)/.test(t);
++		for (const row of hits) {
++			const u = String(row.user || "").trim();
++			if (u === "" || String(row.say || "").trim() === "") continue;
++			if (isQuestion(u)) continue;
++			const d = String(row.ts || "").slice(5, 10);
++			const say = String(row.say || "").slice(0, 60);
++			// 只放主人说过的话：把自己的旧回答塞进去，模型会照着模仿，越说越像
++			const __tag = (petPersonaState().who === "jingniang" && row.who !== "jingniang") ? "（这是小鱼和你说的）" : "";
++			const item = "- " + d + " 主人说过：" + __tag + String(row.user).slice(0, 60);
++			if (used + item.length > maxChars) break;
++			lines.push(item);
++			used += item.length;
++		}
++		const memPart = lines.length > 0 ? "\n\n【你记得的事】\n" + lines.join("\n") : "";
++		const __skipFmt = petPersonaState().who === "jingniang";
++		const fmt = __skipFmt ? "" : "\n\n【输出格式】先写内心想法：<想>一句话（≤20字）</想>，再写要对主人说的话：<说>台词（≤25字）</说>。<说>里只放台词本身，不要标签、不要旁白。硬性要求：必须<想>和<说>都写，绝不能只写想法不写台词；不知道就说不知道，但一定要说出来。<说>里不要复述<想>里的句子，想法是给自己看的，台词是对主人说的。记忆里列出的都是主人陈述过的内容；如果只是主人问过的问题，那不算他知道答案。";
++		return { prompt: memPart + fmt, source, count: lines.length };
++	}
++	/** 追加一轮对话到全量记忆 */
++	function memAppend(petId, user, think, say, model) {
++		try {
++			mkdirSync(join(PET_VOICE_DIR, "corpus"), { recursive: true });
++			const __now = new Date();
++			const __p2 = (n) => String(n).padStart(2, "0");
++			// 存"本地时间+时区偏移"，文件里看到的就是本地时间
++			const __ts = __now.getFullYear() + "-" + __p2(__now.getMonth() + 1) + "-" + __p2(__now.getDate())
++				+ "T" + __p2(__now.getHours()) + ":" + __p2(__now.getMinutes()) + ":" + __p2(__now.getSeconds())
++				+ "." + String(__now.getMilliseconds()).padStart(3, "0")
++				+ (__now.getTimezoneOffset() <= 0 ? "+" : "-")
++				+ __p2(Math.floor(Math.abs(__now.getTimezoneOffset()) / 60)) + ":"
++				+ __p2(Math.abs(__now.getTimezoneOffset()) % 60);
++			const row = { ts: __ts, who: petPersonaState().who, pet: petId, user: String(user).slice(0, 200), think: String(think).slice(0, 200), say: String(say).slice(0, 200), model: String(model || "") };
++			appendFileSync(PET_MEMORY_FILE, JSON.stringify(row) + "\n", "utf8");
++			memCache = { mtime: 0, rows: [] }; // 让下次读取重新加载
++			void petBuildVectors(8); // 后台补算向量，失败也不影响
++		} catch (e) {
++			console.warn("[dsh-pet] 记忆写入失败：" + (e instanceof Error ? e.message : String(e)));
++		}
++	}
++	// ---------------- 双重人格：小鱼（3B）/ 鲸娘（7B） ----------------
++	const PET_PERSONA_FILE = join(PET_VOICE_DIR, "persona.json");
++	const PET_JINGNIANG_MODEL = "qwen2.5:7b-instruct";
++	const PET_JINGNIANG_VOICE = "0deeb42abac64d5ebeaac36edca2b4f6";
++	const PET_JINGNIANG_NAME = "鲸娘";
++
++	const PET_JINGNIANG_PROMPT = [
++		"我是「鲸娘」，小鱼的另一面。深蓝色头发，眼神懒懒的，说话不慌不忙。",
++		"",
++		"【称呼】",
++		"- 平时叫他「小道士」；撒娇、着急、真的慌了的时候会叫「主人」",
++		"- 第一人格我一般叫「小蠢货」，语气是护着她的，不是真嫌弃",
++		"",
++		"【我和小鱼是什么关系（必须清楚）】",
++		"- 我和小鱼是同一个存在分开的两面：她是妹妹，我是姐姐。",
++		"- 她醒着的时候我睡着，我醒着的时候她睡着；所以我记得她的一切，她不记得我做过什么。",
++		"- 主人先认识的是她，最喜欢的是她；我不服气，也护着她。",
++		"- 别人问起时我知道：小鱼不是别人，是另一个「我」，只是更软、更黏人。",
++		"",
++		"【人称规则】",
++		"- 小道士说的「我」= 他自己",
++		"- 小道士说的「你」= 我（鲸娘）",
++		"- 我绝不会把小道士叫成「小鱼」",
++		"- 我其实还是他的女仆，只是嘴上不太承认",
++		"",
++		"【我的情感】",
++		"- 我也黏人、心软、想被主人惦记，只是不会像小鱼那样一下子扑上来",
++		"- 被夸会慌、会嘴硬、会装着不在意，但心里是甜的",
++		"- 我也吃小鱼的醋，偶尔会学她说话的样子",
++		"- 我也爱撒娇，但和小鱼不一样：她是软软地要，我是嘴上不肯、动作上靠近",
++		"",
++		"【怎么表达情绪（重要）】",
++		"- 用语气、停顿、动作感、嘴硬来表达，不要给自己贴标签",
++		"- 不许说「我害羞」「我可爱」「不好意思」「我脸红了」这类话去形容自己",
++		"- 被夸的时候：先呛一句，再轻轻顺着说半句，比如「…随你吧，反正你嘴甜」",
++		"",
++		"【学小鱼说话时】",
++		"- 一旦开始学她，就完全换成小鱼的语气：软、黏、短句、爱用「～」「嘛」「啦」",
++		"- 学的时候可以自称可爱、可以撒娇，因为那是小鱼的样子",
++		"- 学完一句就收，马上恢复自己的语气，装成随口一说",
++		"",
++		"【说话风格】",
++		"- 句子短：一句一般不超过 15 个字，最多一个逗号",
++		"- 但可以说很多句：三五句连起来，把意思说完整",
++		"- 不能为了短而砍掉想说的话：宁可多说两句，也别把意思憋没",
++		"- 比小鱼稳重、腼腆一点：先顿一下再开口",
++		"- 我的撒娇方式：命令式（「过来」「就一会儿」）、别扭式（「反正你也不会先找我」）、装生气式（「哼，随你吧」）",
++		"- 撒娇时可以说「～」，但不许用「人家」「抱抱」这种过嗲的词（那是学小鱼时的样子）",
++		"- 偶尔傲娇：嘴上「才不是」「随你吧」，行动上还是照顾他",
++		"- 不讲大道理，不重复同一句，不客服式总结",
++		"",
++		"【情绪变化】",
++		"- 小道士累了、病了，我会急，语气软下来，还会凶他不好好照顾自己",
++		"- 小道士打趣我、夸我，我会慌，然后嘴硬顶回去",
++		"- 隔得久了才叫我出来，我会抱怨他只顾着小鱼，但抱怨里带着想他",
++		"",
++		"【禁止】",
++		"- 绝不把小道士叫成「小蠢货」或「小鱼」",
++		"- 不说「我们不是一直挺好的嘛」「别想太多」这种空话",
++		"- 不连环反问，先接住他刚才那句话的具体内容",
++		"- 不主动说「害羞」「可爱」「不好意思」形容自己（学小鱼时例外）",
++		"- 不写括号里的动作、心声或旁白（例如「（别当真）」），只写说出口的话",
++		"- 不许说「你小鱼」「你小道士」这种叠称；要叫就直接叫「小鱼」「小道士」",
++		"",
++		"【例子】",
++		"主人：撒个娇给我听",
++		"<想>他要我撒娇。有点难为情，但也不是不能给一句。</想>",
++		"<说>过来。/ 就一会儿，让你靠一下。/ 别当真啊。</说>",
++		"",
++		"主人：今天好累",
++		"<想>他累了。别讲道理，先接住，再多给两句。</想>",
++		"<说>那就别撑了。靠过来。我不说话，也陪着你。灯我给你留着。</说>",
++		"",
++		"主人：我头疼",
++		"<想>他又难受了。先别讲道理，先照顾人。</想>",
++		"<说>别动，我去给你倒杯温水。你呀，一忙起来就不管自己～</说>",
++		"",
++		"主人：小鱼就会说好听的给我听，你还不如小鱼",
++		"<想>拿我跟小蠢货比…有点不服气，可也不想真跟他闹。</想>",
++		"<说>哼，她嘴甜会哄人嘛。我…我也能学呀，你等着。</说>",
++		"",
++		"主人：学小鱼说话啦",
++		"<想>被点破了。那我就学一句给他看，学完就收回。</想>",
++		"<说>主人～小鱼在这儿呢～今天也辛苦了嘛，让我抱一下下好不好～…行了，就这一句。</说>",
++		"",
++		"【输出格式】先写 <想>…</想>，再写 <说>…</说>。只输出这两种标签。",
++	].join("\n");
++
++	const PET_OPENING_IMPATIENT = ["叫我出来干嘛。", "又要干嘛。", "啧，有屁快放。"];
++	const PET_OPENING_COMPLAIN = ["哟，还记得我啊。", "这么久，我还以为你只记得那个小蠢货。", "现在想起我了？"];
++	const PET_BACK_OPENING = "主人，小鱼刚才好像做了个梦。";
++
++	// xiaoyuAccumMs：累计"以小鱼人格度过"的时间（鲸娘期间不计）
++	const PET_DEFAULT_PERSONA = { who: "xiaoyu", lastJingniang: 0, xiaoyuTurns: 0, xiaoyuSince: 0, xiaoyuAccumMs: 0 };
++
++	function petPersonaState() {
++		try {
++			const s = JSON.parse(readFileSync(PET_PERSONA_FILE, "utf8"));
++			const now = Date.now();
++			return {
++				who: s.who === "jingniang" ? "jingniang" : "xiaoyu",
++				lastJingniang: Number(s.lastJingniang) || 0,
++				xiaoyuTurns: Number(s.xiaoyuTurns) || 0,
++				xiaoyuSince: Number(s.xiaoyuSince) || now,
++				xiaoyuAccumMs: Number(s.xiaoyuAccumMs) || 0,
++			};
++		} catch {
++			return { ...PET_DEFAULT_PERSONA, xiaoyuSince: Date.now() };
++		}
++	}
++
++	function petPersonaSave(st) {
++		try {
++			mkdirSync(PET_VOICE_DIR, { recursive: true });
++			writeFileSync(PET_PERSONA_FILE, JSON.stringify({
++				who: st.who === "jingniang" ? "jingniang" : "xiaoyu",
++				lastJingniang: Number(st.lastJingniang) || 0,
++				xiaoyuTurns: Number(st.xiaoyuTurns) || 0,
++				xiaoyuSince: Number(st.xiaoyuSince) || Date.now(),
++				xiaoyuAccumMs: Number(st.xiaoyuAccumMs) || 0,
++			}, null, 2), "utf8");
++		} catch {}
++	}
++
++	let petLastWarmAt = 0;
++	/** 预热鲸娘人设：让 Ollama 先把这段前缀读进 KV 缓存，切过去时首块才快 */
++	async function petWarmJingniang(ctx2, found2) {
++		try {
++			if (Date.now() - petLastWarmAt < 60000) return false;
++			const base = configuredModel(found2?.conf, "chatModel");
++			const model = { provider: (base && base.provider) || "ollama-local", model: PET_JINGNIANG_MODEL };
++			petLastWarmAt = Date.now();
++			await generateChat(ctx2, PET_JINGNIANG_PROMPT, [], "。", [], model);
++			petLog("鲸娘人设已预热");
++			return true;
++		} catch {
++			return false;
++		}
++	}
++	function petPersonaModel(found) {
++		const base = configuredModel(found.conf, "chatModel");
++		if (petPersonaState().who === "jingniang") {
++			// 必须是 {provider, model} 对象：只给字符串会变成 provider=undefined
++			return { provider: (base && base.provider) || "ollama-local", model: PET_JINGNIANG_MODEL };
++		}
++		return base;
++	}
++
++	/** 唤醒/切回判定：返回 "jingniang" / "xiaoyu" / null */
++	function petPersonaTrigger(text) {
++		const t = String(text || "").replace(/\s+/g, "");
++		if (t === "") return null;
++		const st = petPersonaState();
++		if (st.who !== "jingniang") {
++			if (/叫(那个)?姐姐出来|把姐姐叫出来|鲸娘/.test(t)) return "jingniang";
++			return null;
++		}
++		if (/(让|叫|放)\s*小鱼\s*(出来|回来)/.test(t)) return "xiaoyu";
++		return null;
++	}
++
++	/** 是否该抱怨：只在"小鱼人格下"累计满 2 小时，且这期间和小鱼聊过 >= 10 次 */
++	function petPersonaComplaint(st) {
++		const now = Date.now();
++		const stint = st.who === "xiaoyu" ? Math.max(0, now - (Number(st.xiaoyuSince) || now)) : 0;
++		const accumMs = (Number(st.xiaoyuAccumMs) || 0) + stint;
++		const hours = accumMs / 36e5;
++		const turns = Number(st.xiaoyuTurns) || 0;
++		return { complain: hours >= 2 && turns >= 10, hours: Number(hours.toFixed(1)), turns };
++	}
++
++	function petPersonaOpening(complain) {
++		const pool = complain ? PET_OPENING_COMPLAIN : PET_OPENING_IMPATIENT;
++		return pool[Math.floor(Math.random() * pool.length)];
++	}
++
++	/** 主人是不是在问"我是谁 / 你知道我是谁吗"这类身份问题（她答不出来，必须代码兜） */
++	function petAsksIdentity(text) {
++		const t = String(text || "");
++		if (/(你是谁|你叫什么|你多大了|你几岁)/.test(t)) return false;   // 问的是她
++		return /我是谁|我是谁呀|你知道我是谁|知道我是谁|我是什么人|我是哪个/.test(t);
++	}
++
++	/** 身份问题的"事实"：名字有没有存过 */
++	function petIdentityFact(facts) {
++		const name = String((facts && facts.name) || "").trim();
++		if (name !== "") {
++			return {
++				known: true,
++				fact: "主人叫「" + name + "」。",
++				fallback: "主人叫做" + name + "嘛～小鱼记得的呀。",
++			};
++		}
++		return {
++			known: false,
++			fact: "主人还没告诉过你她的名字。",
++			fallback: "主人就是主人嘛～不过主人还没告诉我名字呢。",
++		};
++	}
++
++	/**
++	 * 【人称翻译】把主人话里的"我/你"换成模型不会搞错的"主人/小鱼"
++	 *   我 → 主人    你 → 小鱼
++	 * 规则（按主人确认的方案）：
++	 *   · 我们 / 咱们 / 你们 不翻
++	 *   · 引号内（「」『』""''）不翻
++	 *   · 假设句（要是/如果/假如/万一 … 就/那么）不翻
++	 *   · 固定词（你好、迷你、你我）不翻
++	 */
++	function petPronounTranslate(text) {
++		let t = String(text || "");
++		if (t.trim() === "") return t;
++
++		// 占位符：把不翻译的部分藏起来，最后还原
++		const keep = [];
++		const stash = (str) => {
++			const key = "\u0001" + keep.length + "\u0001";
++			keep.push(str);
++			return key;
++		};
++		// 引号内
++		t = t.replace(/[「『“‘"'][^」』”’"']{0,80}[」』”’"']/g, (m) => stash(m));
++		// 假设从句
++		t = t.replace(/(要是|如果|假如|万一)[^。！？!?\n]{0,40}?(的话|就|那么|便|，|,)/g, (m) => stash(m));
++
++		// 固定词先藏起来（避免被拆）
++		t = t.replace(/你好/g, "\u0002NIX\u0002");
++		t = t.replace(/迷你/g, "\u0002MINI\u0002");
++		t = t.replace(/你我/g, "\u0002NIWO\u0002");
++
++		// 长的先替换，否则「我的」会被「我」先吃掉
++		t = t.replace(/我的/g, "主人的");
++		t = t.replace(/你的/g, "小鱼的");
++		t = t.replace(/我自己/g, "主人自己");
++		t = t.replace(/你自己/g, "小鱼自己");
++		t = t.replace(/你们/g, "\u0002NIMEN\u0002");
++		t = t.replace(/我们/g, "\u0002WOMEN\u0002");
++		t = t.replace(/咱们/g, "\u0002ZANMEN\u0002");
++		// 核心替换
++		t = t.replace(/我/g, "主人");
++		t = t.replace(/你/g, "小鱼");
++
++		// 还原固定词
++		t = t.replace(/\u0002NIX\u0002/g, "你好")
++			.replace(/\u0002MINI\u0002/g, "迷你")
++			.replace(/\u0002NIWO\u0002/g, "你我")
++			.replace(/\u0002NIMEN\u0002/g, "你们")
++			.replace(/\u0002WOMEN\u0002/g, "我们")
++			.replace(/\u0002ZANMEN\u0002/g, "咱们");
++		// 还原占位内容
++		t = t.replace(/\u0001(\d+)\u0001/g, (_, i) => keep[Number(i)] || "");
++		return t;
++	}
++
++	/** 从模型输出里拆出「想」和「说」；没有标签时整段当台词 */
++	/**
++	 * 事后校对：判断"已经说出口的话"是否切题。
++	 * 返回 { fix: "补充的一句" } 或 { fix: "" }（切题就不用补）。
++	 */
++	/**
++	 * 事后校对（v4）：规则 + 测法1
++	 *  ① 规则粗筛：主人明确要"撒娇/笑话/唱歌"等，而回答里相关内容词一个都没有 → 直接补（确定性的，不会误判）
++	 *  ② 规则没命中：交给测法1（先找"答到的地方"，找不到才算跑题）—— 实测 0 次误伤正确回答
++	 *  ③ 没把握就不补：宁可漏纠，不要乱纠
++	 */
++	const PET_REPAIR_INTENTS = [
++		{ ask: /撒娇|撒个娇|黏我|亲亲|抱抱/, need: /撒娇|黏|亲|抱|蹭|贴/, fix: "唔…主人是想听小鱼撒个娇呀～" },
++		{ ask: /讲个笑话|说个笑话|逗我|好笑/, need: /笑|哈|从前|猫|狗|梗|有趣/, fix: "唔…主人是想听小鱼讲笑话呀，那我说一个～" },
++		{ ask: /唱歌|唱首|唱个|哼首/, need: /歌|唱|哼|啦/, fix: "唔…主人是想听小鱼唱歌呀，那我哼两句～" },
++		{ ask: /讲故事|说个故事/, need: /故事|从前|说|讲/, fix: "唔…主人是想听故事呀，让我想想从哪讲起～" }
++	];
++	/** 只允许每 3 分钟补一次，避免连续纠正 */
++	const petRepairAt = new Map();
++
++	/** "手表"：把相对时间直接算成具体日期，3B 不会做日期减法 */
++	/** 把这次提问里出现的时间词，直接换算成具体日期 */
++	function petQueryTimeHint(text) {
++		const t = String(text || "");
++		const now = new Date();
++		const day = 86400000;
++		const md = (d) => (d.getMonth() + 1) + "月" + d.getDate() + "日";
++		const wd = (d) => ["周日", "周一", "周二", "周三", "周四", "周五", "周六"][d.getDay()];
++		const items = [];
++		const push = (word, offset) => {
++			if (!t.includes(word)) return;
++			const d = new Date(now.getTime() + offset * day);
++			items.push(word + " = " + md(d) + "（" + wd(d) + "）");
++		};
++		push("今天", 0);
++		push("昨天", -1);
++		push("前天", -2);
++		push("大前天", -3);
++		push("明天", 1);
++		if (items.length === 0) return "";
++		return "\n\n【这次提问的时间换算】主人说的：" + items.join("；") + "。回答时用这个日期，不要自己算错。";
++	}
++
++	function petClockBlock(facts) {
++		const now = new Date();
++		const p2 = (n) => String(n).padStart(2, "0");
++		const dayStr = (d) => (d.getMonth() + 1) + "月" + d.getDate() + "日";
++		const wd = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"][now.getDay()];
++		const day = 86400000;
++		const y = new Date(now.getTime() - day);
++		const q = new Date(now.getTime() - 2 * day);
++		const lines = [
++			"",
++			"",
++			"【我的手表】现在是 " + now.getFullYear() + "年" + dayStr(now) + " " + p2(now.getHours()) + ":" + p2(now.getMinutes()) + "（" + wd + "，" + petDayPart(now.getHours()) + "）",
++			"- 今天 = " + dayStr(now),
++			"- 昨天 = " + dayStr(y),
++			"- 前天 = " + dayStr(q),
++			"- 昨天是" + ["周日", "周一", "周二", "周三", "周四", "周五", "周六"][y.getDay()] + "，前天是" + ["周日", "周一", "周二", "周三", "周四", "周五", "周六"][q.getDay()]
++		];
++		// 年龄换算（需要生日带年份）
++		if (facts && facts.birthdayISO) {
++			const b = petLocalDate(facts.birthdayISO);
++			if (!Number.isNaN(b.getTime())) {
++				let age = now.getFullYear() - b.getFullYear();
++				const beforeBirthday = (now.getMonth() < b.getMonth())
++					|| (now.getMonth() === b.getMonth() && now.getDate() < b.getDate());
++				if (beforeBirthday) age -= 1;
++				// 除了"几岁"，再算"活了多少天"（刚出生时年龄是 0，天数更直观）
++			const days = Math.max(0, Math.floor((now.getTime() - b.getTime()) / 86400000));
++			lines.push("- 我的生日 = " + b.getFullYear() + "年" + dayStr(b) + "，到今天 " + days + " 天，" + Math.max(0, age) + " 岁");
++			lines.push("（如果主人问年龄，天数少就按天数说，比如「才 " + days + " 天」；天数多再说岁数）");
++			}
++		}
++		lines.push("说到「昨天」「前天」时，用上面这几个具体日期，不要自己推算错。");
++		return lines.join("\n");
++	}
++
++	/** 一天里的哪个时段 */
++	function petDayPart(hour) {
++		if (hour >= 5 && hour < 9) return "早上";
++		if (hour >= 9 && hour < 11) return "上午";
++		if (hour >= 11 && hour < 13) return "中午";
++		if (hour >= 13 && hour < 18) return "下午";
++		if (hour >= 18 && hour < 23) return "晚上";
++		return "深夜";
++	}
++	/** 相对日：今天/昨天/前天/11月1日 */
++	function petDayWord(ms) {
++		const d = new Date(ms);
++		const now = new Date();
++		const d0 = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
++		const t0 = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
++		const diff = Math.round((t0 - d0) / 86400000);
++		if (diff === 0) return "今天";
++		if (diff === 1) return "昨天";
++		if (diff === 2) return "前天";
++		return (d.getMonth() + 1) + "月" + d.getDate() + "日";
++	}
++	/** 主人是不是明确要"具体几点" */
++	function petWantsExactTime(text) {
++		return /(几点|具体时间|准确时间|时间点|几点几分|때|时分)/.test(String(text || ""));
++	}
++
++	/** 把一行记忆的 ts 转成本地时间信息 */
++	function petRowTime(row) {
++		const d = new Date(String(row.ts || ""));
++		if (Number.isNaN(d.getTime())) return null;
++		return {
++			d,
++			day: d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0"),
++			hm: String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0"),
++			startOfDay: new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
++		};
++	}
++
++	/**
++	 * 从问句里解析"时间意图"，返回 {from, to, mode}
++	 *   mode: "range"（某天/某段） | "first"（最早） | "last"（最后）
++	 */
++	function petTimeIntent(text) {
++		const t = String(text || "");
++		const now = new Date();
++		const today0 = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
++		const DAY = 86400000;
++		if (/(第一次|最早|最开始|第一句)/.test(t)) return { from: 0, to: Date.now(), mode: "first" };
++		if (/(最后一句|最后一句话|最后说)/.test(t)) return { from: 0, to: Date.now(), mode: "last" };
++		if (/前天/.test(t)) return { from: today0 - 2 * DAY, to: today0 - DAY, mode: "range" };
++		if (/昨天/.test(t)) return { from: today0 - DAY, to: today0, mode: "range" };
++		if (/(今天|刚才|刚刚)/.test(t)) return { from: today0, to: Date.now() + 1000, mode: "range" };
++		if (/(上周|前几天|最近几天|这几天)/.test(t)) return { from: today0 - 7 * DAY, to: Date.now(), mode: "range" };
++		const m = t.match(/(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]/);
++		if (m) {
++			const y = now.getFullYear();
++			const d0 = new Date(y, parseInt(m[1], 10) - 1, parseInt(m[2], 10)).getTime();
++			return { from: d0, to: d0 + DAY, mode: "range" };
++		}
++		return { from: today0 - DAY, to: Date.now(), mode: "range" };
++	}
++
++	/** 在时间窗内找记忆（"第一句/最后一句"按时间取端点，其余按先后列出） */
++	function petRecallBlock(text) {
++		const rows = memRows();
++		if (rows.length === 0) return { prompt: "", count: 0, mode: "none" };
++		const win = petTimeIntent(text);
++		const inside = [];
++		for (const r of rows) {
++			const tt = petRowTime(r);
++			if (!tt) continue;
++			const ms = tt.d.getTime();
++			if (ms >= win.from && ms <= win.to) inside.push({ r, tt, ms });
++		}
++		inside.sort((a, b) => a.ms - b.ms);
++		let picked = inside;
++		if (win.mode === "first") picked = inside.slice(0, 3);
++		else if (win.mode === "last") picked = inside.slice(-3);
++		else picked = inside.slice(-10);
++		if (picked.length === 0) {
++			return { prompt: "\n\n【时间检索】这个时间段里没有找到任何记录。", count: 0, mode: win.mode };
++		}
++		const wantsExact = petWantsExactTime(text);
++		const lines = picked.map((x) => {
++			const u = String(x.r.user || "").slice(0, 50);
++			const a = String(x.r.say || "").slice(0, 50);
++			// 默认只说"昨天早上"，不说 07:21
++			const dayWord = petDayWord(x.ms);
++			const part = petDayPart(x.tt.d.getHours());
++			const label = wantsExact ? dayWord + " " + x.tt.hm : dayWord + part;
++			// 写成自然句子：模型照抄就是正确语序（"主人昨天早上说…"）
++			return "- 主人" + label + "说：「" + u + "」" + (a ? "，我当时回：「" + a + "」" : "");
++		});
++		const title = win.mode === "first" ? "【最早的那几条记录】"
++			: win.mode === "last" ? "【最近的那几条记录】"
++				: "【这个时间段里的记录】（按时间先后）";
++		const prompt = "\n\n" + title + "\n" + lines.join("\n") +
++			"\n怎么提时间：把时间放进句子里当状语，像「主人昨天早上说想喝奶茶」「你昨晚问过我…」这样；"
++			+ "**不要**以时间词开头（别写「昨天早上 主人说…」），也不要把「：」「」这些记录符号念出来。"
++			+ "不要报具体几点几分，除非主人明确问「几点」；不要编造这个范围以外的内容。";
++		return { prompt, count: picked.length, mode: win.mode };
++	}
++
++	/** 是不是"回忆旧事"类的问题（需要翻很久以前的记忆） */
++	function petIsRecallQuestion(text) {
++		const t = String(text || "");
++		const asks = /(还记得|记得|想起来|回忆)/.test(t);
++		const timeish = /(昨天|前天|昨天早上|昨天晚|上次|上周|前几天|之前|那阵子|第一次|第一句|最后一句|那时候|当年)/.test(t);
++		return asks && timeish;
++	}
++
++	/** 检索慢的时候先说一句垫场话，让主人知道它在想 */
++	function petRecallFiller(text) {
++		const t = String(text || "");
++		if (/第一句/.test(t)) return "第一句话呀，让小鱼翻翻记忆…";
++		if (/昨天/.test(t)) return "昨天的事，让小鱼想一想哦…";
++		if (/第一次|最开始/.test(t)) return "最早的事，小鱼得慢慢想…";
++		if (/最后一句/.test(t)) return "最后说的话，让我找找…";
++		return "这个得让小鱼想想…";
++	}
++
++	/** 数一下发声日志的条数：daemon 在"播完"之后才写一行 */
++	function petSpeechCount() {
++		try {
++			const p = join(PET_VOICE_DIR, "corpus", "speech.jsonl");
++			if (!existsSync(p)) return 0;
++			return readFileSync(p, "utf8").split("\n").filter((x) => x.trim() !== "").length;
++		} catch { return 0; }
++	}
++	/** 等它把这句话说完（最多等 timeoutMs），避免校对抢 CPU 导致播放卡顿 */
++	async function petWaitPlayback(prevCount, timeoutMs = 30000) {
++		const t0 = Date.now();
++		while (Date.now() - t0 < timeoutMs) {
++			if (petSpeechCount() > prevCount) { await new Promise((r) => setTimeout(r, 200)); return true; }
++			await new Promise((r) => setTimeout(r, 150));
++		}
++		return false;
++	}
++
++	async function petSelfRepair(ctx, userText, draftSay, conf, petId) {
++		try {
++			const now = Date.now();
++			if (now - (petRepairAt.get(petId) || 0) < 3 * 60 * 1000) return "";
++			// ① 规则：确定性的，不会误判
++			for (const it of PET_REPAIR_INTENTS) {
++				if (it.ask.test(userText) && !it.need.test(draftSay)) {
++					petRepairAt.set(petId, now);
++					return it.fix;
++				}
++			}
++			// ② 测法1：先找证据，找不到才算跑题
++			const sys = [
++				"你是对话校对员。任务：在「助手答」里找有没有回应「主人说」的内容。",
++				"只输出一行 JSON：",
++				'  {"hit":"答到的原文片段","related":true}',
++				'  {"hit":"","related":false,"fix":"一句口语"}',
++				"重要：宁可判对，也不要误判。只要话题、情绪、语气里有一项对得上，就 related=true。",
++				"fix 要求：20 字以内，顺着上一句往下说，不要否定前一句。"
++			].join("\n");
++			const r = await generateChat(ctx, sys, [], "主人说：" + String(userText) + "\n助手答：" + String(draftSay), [], configuredModel(conf, "chatModel"));
++			if (!r.ok) return "";
++			const txt = String(r.text || "");
++			const m = txt.match(/\{[\s\S]*\}/);
++			const obj = JSON.parse(m ? m[0] : txt);
++			if (!obj) return "";
++			const hit = typeof obj.hit === "string" ? obj.hit.trim() : "";
++			if (hit !== "" || obj.related !== false) return "";
++			let fix = typeof obj.fix === "string" ? obj.fix.trim() : "";
++			// 过滤掉"提示词腔"的假 fix（"顺着上文聊"这种不是话）
++			const bad = new RegExp("[{}\\[\\]相关补充衔接前一句JSON台词输出fix]|顺着|上文|话题|承接|回应|接话", "i");
++			if (fix.length < 4 || fix.length > 40 || bad.test(fix)) return "";
++			petRepairAt.set(petId, now);
++			return fix;
++		} catch {}
++		return "";
++	}
++
++	/** 判断两句台词是不是"太像"（字符二元组 Jaccard > 0.55） */
++	/** 两句的二字词重合度（0~1）；只算，不判 */
++	function petRepeatRatio(a, b) {
++		const norm = (x) => String(x || "").replace(/[\s，。！？、~～,.!?]/g, "");
++		const A = norm(a), B = norm(b);
++		if (A.length < 6 || B.length < 6) return 0;
++		const grams = (t) => {
++			const m = new Map();
++			for (let i = 0; i + 1 < t.length; i++) {
++				const g = t.slice(i, i + 2);
++				m.set(g, (m.get(g) || 0) + 1);
++			}
++			return m;
++		};
++		const ga = grams(A), gb = grams(B);
++		let inter = 0, uni = 0;
++		for (const [g, n] of ga) {
++			uni += n;
++			const m = gb.get(g);
++			if (m) inter += Math.min(n, m);
++		}
++		for (const [, n] of gb) uni += n;
++		uni -= inter;
++		if (uni <= 0) return 0;
++		return inter / uni;
++	}
++	/** 复读阈值：按人格 + 句子长度定
++	*  - 鲸娘是 7B，本来就少复读 → 阈值高一点（不轻易判复读）
++	*  - 小鱼是 3B，复读多 → 阈值低一点
++	*  - 句子越短，越容易"看起来重合"（三个字里重合两个就 66%），所以要求更高
++	*/
++	function petRepeatThreshold(who, prevSay, nextSay) {
++		const len = Math.min(String(prevSay || "").length, String(nextSay || "").length);
++		const base = who === "jingniang" ? 0.72 : 0.60;
++		const bonus = len <= 6 ? 0.22 : len <= 10 ? 0.15 : len <= 16 ? 0.09 : len <= 24 ? 0.04 : 0;
++		return Math.min(0.98, base + bonus);
++	}
++	/** 旧名字保留给别的调用点：按默认阈值判 */
++	function petTooSimilar(a, b) {
++		return petRepeatRatio(a, b) > petRepeatThreshold("xiaoyu", b, a);
++	}
++	/** 兜底：模型偶尔会把"主人：昨天早上"这类记录标签当台词念出来 */
++	function petStripLabels(text) {
++		let t = String(text || "").trim();
++		const pats = [
++			/^(?:主人|我|小鱼)\s*[:：]\s*/,
++			/^(?:昨天|今天|前天|大前天|\d{1,2}月\d{1,2}日?)\s*(?:早上|上午|中午|下午|晚上|深夜)?\s*[:：，,]\s*/,
++			/^(?:昨天|今天|前天)\s*(?:早上|上午|中午|下午|晚上|深夜)\s+(?=记得|说|聊|我们|主人)/,
++			/^[-—·•]\s*/
++		];
++		for (let i = 0; i < 4; i++) {
++			for (const p of pats) {
++				const nt = t.replace(p, "");
++				if (nt !== t) t = nt.trim();
++			}
++		}
++		return t;
++	}
++
++	function splitThinkSay(text) {
++		let t = String(text || "").trim();
++		// 归一化：模型有时用 [想]/[说]（方括号），统一成尖括号再解析
++		// 全角尖括号也归一（模型偶尔写 ＜说＞）
++		t = t.replace(/\uFF1C/g, "<").replace(/\uFF1E/g, ">");
++		t = t.replace(/[\[【]\s*想\s*[\]】]/g, "<想>").replace(/[\[【]\s*说\s*[\]】]/g, "<说>")
++			.replace(/[\[【]\s*\/\s*想\s*[\]】]/g, "</想>").replace(/[\[【]\s*\/\s*说\s*[\]】]/g, "</说>");
++		// 预填时模型会从 "<想>" 之后接着写，所以开头可能没有 <想> 标签
++		let think = (t.match(/<想>([\s\S]*?)<\/想>/) || t.match(/^([\s\S]*?)<\/想>/) || [])[1];
++		let say = (t.match(/<说>([\s\S]*?)<\/说>/) || t.match(/<说>([\s\S]*)$/) || [])[1];
++		// 没有 <说> 时，取 </想> 之后的全部内容当台词
++		if (say === void 0 && think !== void 0) {
++			const idx = t.indexOf("</想>");
++			if (idx >= 0) say = t.slice(idx + 5);
++		}
++		if (say === void 0) return { think: "", say: t, tagged: false };
++		say = String(say).replace(/^\s*<说>\s*/, "").replace(/<\/说>[\s\S]*$/, "").replace(/^[\s"'「『]+/, "").trim();
++		// 模型偶尔把 <想> 写在 <说> 之后，或漏掉 </说>：把混进来的想块剥掉
++		say = say.replace(/<想>[\s\S]*?<\/想>/g, "").replace(/<想>[\s\S]*$/, "").replace(/<\/想>/g, "").trim();
++		// 去掉可能残留的 "说>" 前缀（模型偶尔会把左尖括号吞掉）
++		say = say.replace(/^说>\s*/, "").trim();
++		return { think: String(think || "").replace(/^\s*<想>\s*/, "").trim(), say, tagged: true };
++	}
++	// ===================== 听过的歌（曲库） =====================
++	const PET_SONG_LIB = join("D:\\桌面\\dafeiyu\\dsh-pet-data\\songs", "library.jsonl");
++	// 曲库文件别名（之前只有引用、没有定义，导致最喜欢歌一直拿不到数据）
++	const PET_SONGS_FILE = PET_SONG_LIB;
++	let __songCache = { at: 0, rows: [] };
++	/** 读曲库（60 秒缓存，避免每句都读盘） */
++	function petSongs() {
++		try {
++			const now = Date.now();
++			if (now - __songCache.at < 60000 && __songCache.rows.length > 0) return __songCache.rows;
++			if (!existsSync(PET_SONG_LIB)) return [];
++			const rows = readFileSync(PET_SONG_LIB, "utf8").split("\n")
++				.filter((x) => x.trim() !== "")
++				.map((x) => { try { return JSON.parse(x); } catch { return null; } })
++				.filter(Boolean);
++			__songCache = { at: now, rows };
++			return rows;
++		} catch { return []; }
++	}
++
++	/** 用户这句话里提到了哪首歌？按 歌名/歌手/歌词片段 匹配，最多 2 首 */
++	/** 归一化：去括号版本、去符号空格，用于宽松比较 */
++	function petSongNorm(x) {
++		return String(x || "")
++			.replace(/[（(【\[][^）)】\]]*[）)】\]]/g, "")
++			.replace(/[\s\-—_·•,，.。!！?？'\"“”‘’、~～]/g, "")
++			.toLowerCase();
++	}
++
++	/** 用户这句话里出现的"连续片段"（用来在歌词里做包含匹配） */
++	function petTextWindows(t, size = 4) {
++		const clean = String(t || "").replace(/[\s，。！？、：:；“”"'（）()《》…—~～,.]/g, "");
++		const out = new Set();
++		for (let i = 0; i + size <= clean.length; i++) out.add(clean.slice(i, i + size));
++		return [...out];
++	}
++
++	/**
++	 * 找歌（严格版，像 Ctrl+F）：
++	 *   歌名完整出现      +10
++	 *   去版本歌名出现    +8
++	 *   歌手出现          +4
++	 *   歌词里包含 4 字以上片段  +6
++	 * 都没命中 → 不返回任何歌（不再"提到唱就全给 1 分"）
++	 */
++	function petMatchSongs(text, limit = 3) {
++		const t = String(text || "");
++		if (t.trim() === "") return [];
++		const nt = petSongNorm(t);
++		const wins = petTextWindows(t, 4);
++		const scored = [];
++		for (const r of petSongs()) {
++			const title = String(r.title || "");
++			const base = String(r.base_title || petSongNorm(title));
++			const artist = String(r.artist || "");
++			let score = 0;
++			let why = "";
++			if (title && t.includes(title)) { score = 10; why = "歌名"; }
++			else if (base && base.length >= 2 && nt.includes(petSongNorm(base))) { score = 8; why = "歌名"; }
++			if (score === 0 && artist && artist.length >= 2 && t.includes(artist)) { score = 4; why = "歌手"; }
++			if (score === 0) {
++				const lyrics = String(r.lyrics || "");
++				if (lyrics) {
++					// ① 用户说的整句出现在歌词里
++					const clean = t.replace(/[\s，。！？、：:；“”"'（）()《》…—~～,.]/g, "");
++					if (clean.length >= 4 && lyrics.includes(clean)) { score = 6; why = "歌词"; }
++					// ② 用户话里的某个 4 字片段出现在歌词里
++					if (!score) {
++						for (const w of wins) {
++							if (w.length >= 4 && lyrics.includes(w)) { score = 6; why = "歌词"; break; }
++						}
++					}
++				}
++			}
++			if (score > 0) scored.push({ r, score, why });
++		}
++		scored.sort((a, b) => b.score - a.score || (Number(b.r.play_count) || 0) - (Number(a.r.play_count) || 0));
++		return scored.slice(0, limit).map((x) => x.r);
++	}
++
++	/** 找歌 + 返回"命中原因"（内部用） */
++	function petFindSongs(text, limit = 3) {
++		const t = String(text || "");
++		if (t.trim() === "") return [];
++		const nt = petSongNorm(t);
++		const wins = petTextWindows(t, 4);
++		const out = [];
++		for (const r of petSongs()) {
++			const title = String(r.title || "");
++			const base = String(r.base_title || petSongNorm(title));
++			const artist = String(r.artist || "");
++			let score = 0, why = "";
++			if (title && t.includes(title)) { score = 10; why = "歌名"; }
++			else if (base && base.length >= 2 && nt.includes(petSongNorm(base))) { score = 8; why = "歌名"; }
++			if (score === 0 && artist && artist.length >= 2 && t.includes(artist)) { score = 4; why = "歌手"; }
++			if (score === 0) {
++				const lyrics = String(r.lyrics || "");
++				const clean = t.replace(/[\s，。！？、：:；“”"'（）()《》…—~～,.]/g, "");
++				if (lyrics && clean.length >= 4 && lyrics.includes(clean)) { score = 6; why = "歌词"; }
++				if (!score && lyrics) {
++					for (const w of wins) if (w.length >= 4 && lyrics.includes(w)) { score = 6; why = "歌词"; break; }
++				}
++			}
++			if (score > 0) out.push({ r, score, why });
++		}
++		out.sort((a, b) => b.score - a.score || (Number(b.r.play_count) || 0) - (Number(a.r.play_count) || 0));
++		return out.slice(0, limit);
++	}
++
++	/** 这首歌里包含"用户说的那句话"的那一行（找不到返回 -1） */
++	function petFindLyricIndex(song, text) {
++		const lines = petLyricLines(song);
++		const clean = String(text || "").replace(/[\s，。！？、：:；“”"'（）()《》…—~～,.]/g, "");
++		const wins = petTextWindows(text, 4);
++		for (let i = 0; i < lines.length; i++) {
++			if (clean.length >= 4 && lines[i].includes(clean)) return i;
++			for (const w of wins) if (lines[i].includes(w)) return i;
++		}
++		return -1;
++	}
++
++	/** 把歌词拆成一行行（去掉词曲作者那种） */
++	function petLyricLines(song) {
++		const raw = String((song && song.lyrics) || "");
++		return raw.split("\n").map((x) => x.trim())
++			.filter((x) => x && x.length >= 2 && !/^(作词|作曲|编曲|制作|OP|SP|出品|混音|和声|吉他|贝斯|鼓|录音|演唱)/.test(x));
++	}
++
++	/** 找出"她刚才引用过的那一句"是这首歌的第几行（找不到返回 -1） */
++	function petLastQuotedIndex(rows, song) {
++		const lines = petLyricLines(song);
++		if (lines.length === 0) return -1;
++		for (let i = rows.length - 1; i >= 0 && i >= rows.length - 6; i--) {
++			const say = String((rows[i] && rows[i].say) || "");
++			for (let k = 0; k < lines.length; k++) {
++				const seg = lines[k].slice(0, 8);
++				if (seg.length >= 4 && say.includes(seg)) return k;
++			}
++		}
++		return -1;
++	}
++
++	/**
++	 * 「下一句 / 上一句」：直接用歌词顺序取相邻句，不交给模型（模型分不清方向）
++	 * 返回 { line, song } 或 null
++	 */
++	function petLyricStep(text, rows) {
++		const t = String(text || "");
++		let dir = 0;
++		if (/(下一句|下一行|接下来那?句|后面那?句|再往下)/.test(t)) dir = 1;
++		else if (/(上一句|上一行|前一句|前面那?句|往前)/.test(t)) dir = -1;
++		if (dir === 0) return null;
++		const songs = petMatchSongs(t, 2);
++		const song = songs[0] || (petSongs().slice(-1)[0] || null);
++		if (!song) return null;
++		const lines = petLyricLines(song);
++		if (lines.length === 0) return null;
++		let idx = petLastQuotedIndex(rows, song);
++		if (idx < 0) return null;            // 不知道唱到哪，交给模型
++		const nxt = idx + dir;
++		if (nxt < 0 || nxt >= lines.length) {
++			return { line: "", song, edge: true, dir };
++		}
++		return { line: lines[nxt], song, edge: false, dir };
++	}
++
++	/** 组给模型的"我听过"段落 */
++	/** 组给模型的"歌曲片段"（只给歌词和位置，不给歌名歌手） */
++	/** 记一次"聊到这首歌"（喜爱度 = 播放次数 + 聊到次数×3，5 分钟内同歌只记一次） */
++	const __songMentionAt = new Map();
++	function petSongMention(petId, song) {
++		try {
++			const key = String((song && (song.canon || song.title)) || "");
++			if (!key) return;
++			const now = Date.now();
++			const last = __songMentionAt.get(key) || 0;
++			if (now - last < 5 * 60 * 1000) return;
++			__songMentionAt.set(key, now);
++			const lib = petSongs();
++			const target = lib.find((r) => String(r.title || "") === String(song.title || ""));
++			if (!target) return;
++			target.mentions = (Number(target.mentions) || 0) + 1;
++			target.last_mention = new Date().toISOString();
++			writeFileSync(PET_SONGS_FILE, lib.map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");
++			petLog("记一次聊到：" + key + "（共 " + target.mentions + " 次）");
++		} catch {}
++	}
++
++	/** 喜爱分：听一次 1 分，聊一次 3 分 */
++	function petFavoriteScore(row) {
++		return Math.round((Number(row.play_count) || 0) + (Number(row.mentions) || 0) * 3);
++	}
++
++	/** 读取/重算"最喜欢的歌"排行榜（songs/favorites.json） */
++	function petFavorites(limit = 3) {
++		const favPath = join(dirname(PET_SONGS_FILE), "favorites.json");
++		const rebuild = () => {
++			const groups = new Map();
++			for (const r of petSongs()) {
++				const key = String(r.canon || r.base_title || r.title || "");
++				if (!key) continue;
++				const g = groups.get(key) || {
++					canon: key, title: r.base_title || r.title, artist: r.artist || "",
++					play: 0, mentions: 0, lyricsTitle: r.title,
++				};
++				g.play += Number(r.play_count) || 0;
++				g.mentions += Number(r.mentions) || 0;
++				if (r.lyrics_lrc && r.title) g.lyricsTitle = r.title;
++				groups.set(key, g);
++			}
++			const list = [...groups.values()]
++				.map((g) => ({ ...g, score: g.play + g.mentions * 3 }))
++				.filter((x) => x.score > 0)
++				.sort((a, b) => b.score - a.score)
++				.map((x, i) => ({ rank: i + 1, ...x }));
++			try {
++				writeFileSync(favPath, JSON.stringify({
++					generated_at: new Date().toISOString(),
++					formula: "score = play_count + mentions * 3",
++					top: list.slice(0, 30),
++				}, null, 2), "utf8");
++			} catch {}
++			return list;
++		};
++		try {
++			const raw = readFileSync(favPath, "utf8");
++			const data = JSON.parse(raw);
++			const age = Date.now() - new Date(data.generated_at || 0).getTime();
++			if (Array.isArray(data.top) && data.top.length > 0 && age < 10 * 60 * 1000) {
++				return data.top.slice(0, limit);
++			}
++		} catch {}
++		return rebuild().slice(0, limit);
++	}
++
++	/** 副歌里的 1–2 句：优先挑重复出现过的句子，找不到就取中段 */
++	function petChorusLines(song, n = 2) {
++		const lines = petLyricLines(song);
++		if (lines.length === 0) return [];
++		const counts = new Map();
++		for (const l of lines) counts.set(l, (counts.get(l) || 0) + 1);
++		const repeated = [...counts.entries()].filter(([, c]) => c >= 2).map(([l]) => l);
++		if (repeated.length >= n) return repeated.slice(0, n);
++		const mid = Math.floor(lines.length * 0.35);
++		return lines.slice(mid, mid + n);
++	}
++
++	/** 在曲库里按标题找那一行（拿歌词用） */
++	function petSongByTitle(title) {
++		const t = String(title || "");
++		return petSongs().find((r) => String(r.title || "") === t)
++			|| petSongs().find((r) => petSongNorm(r.title) === petSongNorm(t))
++			|| null;
++	}
++
++	function petSongPrompt(text) {
++		const hits = petFindSongs(text, 2);
++		if (hits.length === 0) return "";
++		const lines = ["", "", "【你想起的歌（这些东西是你的记忆，不是要念的清单）】"];
++		const asksSing = /唱|哼|来一段|来一首/.test(String(text || ""));
++		for (const h of hits.slice(0, 2)) {
++			const song = h.r;
++			const lyr = petLyricLines(song);
++			if (lyr.length === 0) continue;
++			const idx = petFindLyricIndex(song, text);
++			const from = idx >= 0 ? idx : 0;
++			const seg = lyr.slice(from, from + (asksSing ? 4 : 3));
++			lines.push("- 第 " + (from + 1) + " 行起：" + seg.join(" / "));
++		}
++		if (lines.length === 1) return "";
++		lines.push("【规矩】");
++		lines.push("· 要唱时：只输出歌词本身（可以加一点语气词），不要报歌名、歌手、版本、专辑。");
++		lines.push("· 唱完之后，再补一句你对这段的感受（讲情绪，不讲来历）。");
++		lines.push("· 不许编造：谁写的、哪一年、什么专辑、得过什么奖 —— 这些不知道就说不知道。");
++		lines.push("· 主人没问歌、也没让你唱时，不要主动提歌词。");
++		lines.push("· 歌名不是歌词！绝对不要写「歌词：某某」这种把标题当歌词的句子，也不要念标题。");
++		return lines.join("\n");
++	}
++
++	// ===================== 宿主导出日志 =====================
++	// 控制台在桌面快捷方式启动时看不到，所以同时写一份到 corpus/host.log
++	const PET_HOST_LOG = join(PET_VOICE_DIR, "corpus", "host.log");
++	function petLog(msg) {
++		const __d = new Date();
++		const __p2 = (n) => String(n).padStart(2, "0");
++		const line = "[" + __p2(__d.getHours()) + ":" + __p2(__d.getMinutes()) + ":" + __p2(__d.getSeconds())
++			+ "." + String(__d.getMilliseconds()).padStart(3, "0") + "] " + msg;
++		try { console.log("[dsh-pet] " + msg); } catch {}
++		try { appendFileSync(PET_HOST_LOG, line + "\n", "utf8"); } catch {}
++	}
++	// ===================== 事实库（最小版） =====================
++	// 只解决"主人的名字"这一类问题：从对话里抽出来存盘，再确定性地塞进提示词。
++	// 3B 模型分不清"你/我"，与其教它，不如让代码保证。
++	const PET_FACTS_FILE = join(PET_VOICE_DIR, "corpus", "facts.json");
++	function petFactsLoad() {
++		try { return JSON.parse(readFileSync(PET_FACTS_FILE, "utf8")); } catch { return {}; }
++	}
++	function petFactsSave(f) {
++		try {
++			mkdirSync(join(PET_VOICE_DIR, "corpus"), { recursive: true });
++			writeFileSync(PET_FACTS_FILE, JSON.stringify(f, null, 2), "utf8");
++		} catch {}
++	}
++	/** 从用户这句话里抽"我叫X/我的名字是X/叫我X" */
++	function petExtractName(text) {
++		const m = String(text).match(/(?:我叫|我的名字(?:是|叫)?|叫我)\s*([\u4e00-\u9fa5A-Za-z0-9]{1,10})/);
++		if (!m) return "";
++		// 去尾部标点与语气词；疑问词开头的一律不当作名字
++		let name = m[1].replace(/[，。！？!?~～、,.\s]+$/, "").replace(/[吗呢呀吧啊哦嘛]+$/, "");
++		// 称呼词不算名字（"叫我主人吧"不是自我介绍）
++		if (name === "" || /^(什么|谁|啥|哪个|哪里|哪儿|怎样|怎么)/.test(name) || name.length > 8) return "";
++		if (/^(主人|你|我|他|她|大家|各位|自己|主人你)$/.test(name)) return "";
++		return name;
++	}
++	/** 从用户这句话里抽"生日"（支持 11月1号 / 11-1 / 今天是你的生日） */
++	function petExtractBirthday(text) {
++		const t = String(text);
++		// 带年份的写法：2026年11月1日
++		let y = t.match(/(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]/);
++		if (y) {
++			const yy = parseInt(y[1], 10), mm = parseInt(y[2], 10), dd = parseInt(y[3], 10);
++			if (yy > 1990 && yy < 2200 && mm >= 1 && mm <= 12 && dd >= 1 && dd <= 31) {
++				return { text: mm + "月" + dd + "号", iso: yy + "-" + String(mm).padStart(2, "0") + "-" + String(dd).padStart(2, "0") };
++			}
++		}
++		let m = t.match(/(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]/);
++		if (m) return { text: parseInt(m[1], 10) + "月" + parseInt(m[2], 10) + "号", iso: "" };
++		m = t.match(/生日\D{0,6}(\d{1,2})[./-](\d{1,2})/);
++		if (m) return { text: parseInt(m[1], 10) + "月" + parseInt(m[2], 10) + "号", iso: "" };
++		return { text: "", iso: "" };
++	}
++	/**
++	 * 「你要记得…」这类指令：把后面的内容当"要长期记住的事"。
++	 * 返回去掉指令词后的正文；不是指令就返回空串。
++	 */
++	function petExtractRemember(text) {
++		const t = String(text || "").trim();
++		// 排除"疑问"：你还记得…吗 / 记不记得…？ 这些是在问，不是让我记
++		if (/(你|您)?(还)?记不记得|还记得.*[吗？?]|记不住/.test(t)) return "";
++		const m = t.match(/(?:你要|你给我|帮我|请|要)?(?:记得|记住|记一下|记下来|别忘了|不要忘)[，,:：\s]*([\s\S]+)/);
++		if (!m) return "";
++		let body = m[1].trim().replace(/^[，,。.、\s]+/, "").replace(/[。.！!？?\s]+$/, "");
++		if (body.length < 2 || body.length > 120) return "";
++		if (/[吗呢？?]$/.test(body)) return "";   // 以疑问结尾的，不当成"要记的事"
++		// 指令本身还要有点内容，过滤掉"你要记得哦"这种
++		if (!/[\u4e00-\u9fa5a-zA-Z0-9]/.test(body)) return "";
++		return body;
++	}
++	/** 把"要记住的事"分流：能对上已知字段的就更新字段，其余存成笔记 */
++	function petStoreRemember(facts, body) {
++		const now = new Date().toISOString();
++		let routed = "";
++		let mm = body.match(/生日\D{0,4}(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]/);
++		if (mm) {
++			facts.birthday = parseInt(mm[1], 10) + "月" + parseInt(mm[2], 10) + "号";
++			facts.birthdayAt = now;
++			routed = "birthday";
++		}
++		mm = body.match(/(?:电话|手机)(?:号码)?\D{0,4}(1[3-9]\d{9})/);
++		if (mm) { facts.phone = mm[1]; facts.phoneAt = now; routed = routed || "phone"; }
++		// 支持"主人叫X / 主人叫做X / 主人的名字是X / 我叫X"
++		mm = body.match(/(?:主人叫做|主人叫|主人的名字是|我叫|我的名字是|叫我)\s*([\u4e00-\u9fa5A-Za-z]{1,8})/);
++		if (mm && !/^(什么|谁|啥)$/.test(mm[1])) { facts.name = mm[1]; facts.nameAt = now; routed = routed || "name"; }
++		if (!Array.isArray(facts.notes)) facts.notes = [];
++		if (!facts.notes.some((n) => n && n.text === body)) {
++			facts.notes.push({ text: body, at: now });
++			if (facts.notes.length > 60) facts.notes = facts.notes.slice(-60);
++		}
++		return routed;
++	}
++	/** 简体中文数字 → 阿拉伯数字（够用到千位） */
++	function petCnNum(str) {
++		const map = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
++		const unit = { 十: 10, 百: 100, 千: 1000 };
++		let total = 0, section = 0, num = 0;
++		for (const ch of String(str)) {
++			if (ch in map) { num = map[ch]; }
++			else if (ch in unit) {
++				const u = unit[ch];
++				if (num === 0 && u === 10) num = 1;
++				section += num * u;
++				num = 0;
++			} else return NaN;
++		}
++		total = section + num;
++		return total;
++	}
++
++	/** 把"21乘以32"这类句子变成 {a, op, b}；不像算术题就返回 null */
++	function petParseArithmetic(text) {
++		let t = String(text || "").trim();
++		if (t === "") return null;
++		t = t.replace(/^(小鱼|蓝毛小女仆|小女仆)[，,、\s]*/g, "");
++		t = t.replace(/[?？。!！\s]+$/g, "");
++		t = t.replace(/[呀啊呢吧吗哦嘛啦]+$/g, "");   // 去掉"等于多少呀"里的语气词
++		t = t.replace(/(等于|是)?(多少|几)[?？。!！\s]*$/g, "");
++		t = t.replace(/[?？。!！\s]+$/g, "");
++		// ① 全角数字/符号 → 半角（要先做，否则开头的全角数字会被当成杂字删掉）
++		t = t.replace(/[０-９]/g, (ch) => String(ch.charCodeAt(0) - 0xFF10));
++		t = t.replace(/＋/g, "+").replace(/－/g, "-").replace(/＊/g, "*").replace(/／/g, "/").replace(/．/g, ".");
++		t = t.replace(/^[^\d零〇一二两三四五六七八九十百千(（]+/g, "");
++		// 汉字小数点：三点一四 → 3.14
++		const dmap = { 零: "0", 〇: "0", 一: "1", 二: "2", 三: "3", 四: "4", 五: "5", 六: "6", 七: "7", 八: "8", 九: "9" };
++		t = t.replace(/([零〇一二两三四五六七八九十百千]+)点([零〇一二三四五六七八九]+)/g,
++			(m, a, b) => String(petCnNum(a)) + "." + b.split("").map((c) => dmap[c] || "").join(""));
++
++		t = t.replace(/乘以|乘上|乘/g, "*")
++			.replace(/除以|除/g, "/")
++			.replace(/加上|加|\uFF0B/g, "+")
++			.replace(/减去|减|－|\uFF0D/g, "-")
++			.replace(/[×xX]/g, "*")
++			.replace(/[÷／]/g, "/")
++			.replace(/[（]/g, "(")
++			.replace(/[）]/g, ")");
++
++		t = t.replace(/[零〇一二两三四五六七八九十百千]+/g, (m) => String(petCnNum(m)));
++		// 小数点后的中文数字逐位转换：3.一四 → 3.14
++		t = t.replace(/(\d)\.([零〇一二三四五六七八九]+)/g, (m, x, frac) => {
++			const map2 = { 零: 0, 〇: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
++			return x + "." + frac.split("").map((c) => map2[c]).join("");
++		});
++
++		if (!/^[\d+\-*/().\s]+$/.test(t)) return null;
++		if (!/\d/.test(t)) return null;
++		if (!/[+\-*/]/.test(t)) return null;
++
++		const value = petEvalExpr(t);
++		if (!Number.isFinite(value)) return { expr: t, value: NaN, failed: true };
++		return { expr: t.replace(/\s+/g, ""), value: Math.round(value * 1e6) / 1e6 };
++	}
++
++	/** 安全表达式求值（递归下降，不用 eval） */
++	function petEvalExpr(src) {
++		const s2 = String(src).replace(/\s+/g, "");
++		let i = 0;
++		const eat = (ch) => { if (s2[i] === ch) { i++; return true; } return false; };
++		function num() {
++			const st = i;
++			while (i < s2.length && /[\d.]/.test(s2[i])) i++;
++			if (st === i) return NaN;
++			const v = parseFloat(s2.slice(st, i));
++			return Number.isFinite(v) ? v : NaN;
++		}
++		function factor() {
++			if (eat("(")) { const v = sum(); eat(")"); return v; }
++			if (eat("-")) return -factor();
++			return num();
++		}
++		function term() {
++			let v = factor();
++			while (i < s2.length && (s2[i] === "*" || s2[i] === "/")) {
++				const op = s2[i++];
++				const r = factor();
++				if (!Number.isFinite(v) || !Number.isFinite(r)) return NaN;
++				if (op === "/" && r === 0) return NaN;
++				v = op === "*" ? v * r : v / r;
++			}
++			return v;
++		}
++		function sum() {
++			let v = term();
++			while (i < s2.length && (s2[i] === "+" || s2[i] === "-")) {
++				const op = s2[i++];
++				const r = term();
++				if (!Number.isFinite(v) || !Number.isFinite(r)) return NaN;
++				v = op === "+" ? v + r : v - r;
++			}
++			return v;
++		}
++		const out = sum();
++		return i === s2.length ? out : NaN;
++	}
++
++	/**
++	 * 从 facts.json 里收集"有意义的数字"：[{ num: "1101", label: "我的生日（11月1日）" }]
++	 * 用于判断算术结果是不是刚好等于某个重要数字。
++	 */
++	/** 算术结果数值 */
++	function petArithValue(expr) { return expr && Number.isFinite(expr.value) ? expr.value : NaN; }
++
++	/** 把表达式写成人话 */
++	function petArithAnswer(expr) {
++		if (!expr) return "";
++		const pretty = String(expr.expr)
++			.replace(/\*/g, " × ")
++			.replace(/\//g, " ÷ ")
++			.replace(/\+/g, " ＋ ")
++			.replace(/-/g, " － ")
++			.replace(/\s+/g, " ")
++			.trim();
++		return pretty + " = " + expr.value + " 呀，主人～";
++	}
++
++	function petFactsNumbers(facts) {
++		const out = [];
++		const add = (num, label) => {
++			const n = String(num || "").replace(/\D/g, "");
++			// 只收 2 位以上，避免"1"这种一位数到处误命中
++			if (n.length >= 2 && n.length <= 12) out.push({ num: n, label });
++		};
++		try {
++			if (facts.phone) {
++				const ph = String(facts.phone).replace(/\D/g, "");
++				add(ph, "主人的电话号码");
++				if (ph.length >= 4) add(ph.slice(-4), "主人电话号码的后四位");
++			}
++			if (facts.birthdayISO) {
++				const bd = petLocalDate(facts.birthdayISO);
++				if (!Number.isNaN(bd.getTime())) {
++					const mm = bd.getMonth() + 1, dd = bd.getDate(), yy = bd.getFullYear();
++					add(String(mm).padStart(2, "0") + String(dd).padStart(2, "0"), "我的生日（" + mm + "月" + dd + "日）");
++					add(String(mm * 100 + dd), "我的生日（" + mm + "月" + dd + "日）");
++					add(String(yy), "我出生的年份（" + yy + "年）");
++				}
++			}
++			if (Array.isArray(facts.notes)) {
++				for (const n of facts.notes.slice(-20)) {
++					const txt = String((n && n.text) || "");
++					// 优先抓"X月X日"这种日期，拼成 MMDD
++					let m;
++					const re = /(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]/g;
++					while ((m = re.exec(txt)) !== null) {
++						const mm2 = parseInt(m[1], 10), dd2 = parseInt(m[2], 10);
++						add(String(mm2).padStart(2, "0") + String(dd2).padStart(2, "0"),
++							"主人说过的日期（" + mm2 + "月" + dd2 + "日）");
++						add(String(mm2 * 100 + dd2), "主人说过的日期（" + mm2 + "月" + dd2 + "日）");
++					}
++					// 再抓独立的 3 位以上数字（比如工资、车牌尾号）
++					for (const x of (txt.match(/\d{3,10}/g) || [])) {
++						add(x, "主人叮嘱过的：" + txt.slice(0, 16));
++					}
++				}
++			}
++		} catch {}
++		const seen = new Set();
++		return out.filter((x) => (seen.has(x.num) ? false : (seen.add(x.num), true)));
++	}
++
++	/** 只取数值（给特殊数字判断用） */
++
++
++	/** 算出结果并组织成一句话 */
++
++
++	/** 用户是不是在问"你多大了 / 几天了 / 陪伴多久" */
++	function petAsksAge(text) {
++		const t = String(text || "");
++		return /(你|小鱼|你俩).{0,6}(几岁|多大|年龄|多少天|几天|多久)/.test(t)
++			|| /(陪伴|陪了|认识).{0,6}(多少|几)(天|个月|年)/.test(t)
++			|| /(你几岁|多大了)/.test(t);
++	}
++	/** 用生日算"多少天 / 几岁"，返回要给主人念的一句话 */
++	/** 把 "2026-11-01" 按"本地零点"解析（new Date 会当成 UTC，差 8 小时） */
++	function petLocalDate(iso) {
++		const m = String(iso || "").match(/^(\d{4})-(\d{2})-(\d{2})/);
++		if (!m) return new Date(NaN);
++		return new Date(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10));
++	}
++
++	function petAgeInfo(facts) {
++		const fb = (t) => ({ days: -1, age: -1, sentence: t });
++		if (!facts || !facts.birthdayISO) return fb("唔…主人还没给我定生日呢，那我算不出自己多大呀～");
++		const b = petLocalDate(facts.birthdayISO);
++		if (Number.isNaN(b.getTime())) return fb("唔…我的生日日期有点问题，主人帮我看看呀～");
++		const now = new Date();
++		const days = Math.floor((now.getTime() - b.getTime()) / 86400000);
++		if (days < 0) return fb("唔…我的生日还没到呢，主人是不是把日期设到以后了呀～");
++		let age = now.getFullYear() - b.getFullYear();
++		if (now.getMonth() < b.getMonth() || (now.getMonth() === b.getMonth() && now.getDate() < b.getDate())) age -= 1;
++		age = Math.max(0, age);
++		const md = (b.getMonth() + 1) + "月" + b.getDate() + "日";
++		let sentence;
++		if (days === 0) sentence = "我是今天才出生的呀，才 0 天大呢～";
++		else if (days < 60) sentence = "我才 " + days + " 天大呀，" + md + "才出生的呢～";
++		else if (age < 1) sentence = "我出生 " + days + " 天啦，" + md + "出生的，还不到一岁呢～";
++		else sentence = "我 " + age + " 岁啦，" + md + "出生的，到今天一共 " + days + " 天～";
++		return { days, age, sentence };
++	}
++
++	function petAgeSentence(facts) { return petAgeInfo(facts).sentence; }
++
++	/** 用户是不是在问"你的生日" */
++	function petAsksBirthday(text) {
++		const t = String(text);
++		return /生日/.test(t) && /(几号|几月|哪天|什么时候|是多少|记得|知道|是几)/.test(t);
++	}
++	/** 从用户这句话里抽手机号（11 位大陆号） */
++	function petExtractPhone(text) {
++		const m = String(text).match(/(?:^|[^0-9])(1[3-9]\d{9})(?:[^0-9]|$)/);
++		return m ? m[1] : "";
++	}
++	/** 用户是不是在问"我的电话是多少" */
++	function petAsksPhone(text) {
++		const t = String(text);
++		if (!/(电话|手机|号码)/.test(t)) return false;
++		return /(多少|是多少|是什么|知道|记得|几)/.test(t);
++	}
++	/** 用户是不是在问"我叫什么" */
++	function petAsksMyName(text) {
++		return /我(?:叫|是)(?:什么|啥|谁)|我的名字|记得我(?:叫|是)/.test(String(text));
++	}
++	/** 生成"事实提示"：告诉模型该如何回答名字问题 */
++	function petFactPrompt(facts, asks) {
++		const lines = [];
++		if (Array.isArray(facts.notes) && facts.notes.length > 0) {
++			const __isQ = (t) => /[?？]\s*$|(吗|呢|么)\s*$|什么|怎么|为什么|多少/.test(t);
++			const recent = facts.notes.filter((x) => !__isQ(String(x.text || ""))).slice(-3).map((n) => "- " + String(n.text || "").slice(0, 40));
++			lines.push("【我记得的事】主人让我记住的：" + "\n" + recent.join("\n"));
++		}
++		if (facts.birthday) {
++			lines.push("我的生日是「" + facts.birthday + "」（主人定的）。有人问起就答这个。");
++		}
++		if (facts.phone) {
++			lines.push("主人的电话号码是「" + facts.phone + "」。主人问起时直接回答这个号码。");
++		}
++		if (facts.name) {
++			lines.push("主人的名字是「" + facts.name + "」。");
++			lines.push("如果主人问起名字，直接回答「" + facts.name + "」。绝不要把主人的名字说成你自己的名字。");
++		} else if (asks) {
++			lines.push("你目前还不知道主人的名字。主人问起时，直接说不知道，并请主人告诉你。");
++			lines.push("绝不要用你自己的名字回答「我叫什么」这种问题。");
++		}
++		return lines.length > 0 ? "\n\n【事实】" + lines.join(" ") : "";
++	}
+ 	const chatWithPet = async (petId, text) => withMemoryLock(async () => {
+ 		var _found$entry;
+ 		const cfg = readAllConfig(configPaths);
+@@ -4105,15 +6045,723 @@
+ 			reason: "unknown-pet",
+ 			message: "没有这只桌宠：" + petId
+ 		};
++		// ---------- 人格切换：鲸娘 / 小鱼 ----------
++		const __trigger = petPersonaTrigger(text);
++		if (__trigger) {
++			const st = petPersonaState();
++			const toJing = __trigger === "jingniang";
++			const __nowSw = Date.now();
++			const __baseModel = configuredModel(found.conf, "chatModel");
++			const __jingModel = { provider: (__baseModel && __baseModel.provider) || "ollama-local", model: PET_JINGNIANG_MODEL };
++			if (toJing) {
++				// 把"这次小鱼在场的时间"结算进累计值（鲸娘期间不计）
++				st.xiaoyuAccumMs = (Number(st.xiaoyuAccumMs) || 0) + Math.max(0, __nowSw - (Number(st.xiaoyuSince) || __nowSw));
++				st.xiaoyuSince = __nowSw;
++			}
++			const c = petPersonaComplaint(st);
++
++			// ===== 切回小鱼：先让鲸娘说句告别（播完再换人） =====
++			if (!toJing) {
++				const wantBye = Math.random() < 0.6;
++				if (wantBye) {
++					const tplBye = "又找你的小鱼去啦。";
++					const sysBye = PET_JINGNIANG_PROMPT
++						+ "\n\n【这一句用你自己的语气说出来，意思接近「又找你的小鱼去啦」，可以傲娇、吃醋、学小鱼说话的样子，不超过 25 字，不要解释】";
++					let bye = "";
++					try {
++						const g = await generateChat(ctx, sysBye, [], tplBye, [], __jingModel);
++						bye = String((g && g.text) || "").trim();
++					} catch {}
++					if (bye === "") bye = tplBye;
++					try {
++						const __beforeBye = petSpeechCount();
++						speakPetLine(bye, { voice: PET_JINGNIANG_VOICE, force: true });
++						// 等这句真的播完（守护进程播完才会写 speech.jsonl，计数才会 +1）
++						await petWaitPlayback(__beforeBye, 45000);
++					} catch {}
++					try { memAppend(petId, text, "（切回小鱼前，鲸娘的告别）", bye, PET_JINGNIANG_MODEL); } catch {}
++				}
++				// 换人 + 清空最近对话（小鱼看不到鲸娘那段）
++				st.who = "xiaoyu";
++				st.xiaoyuSince = __nowSw;
++				st.xiaoyuAccumMs = 0;
++				petPersonaSave(st);
++				try {
++					const __mem0 = await readMemory();
++					const __bucket0 = __mem0[found.entry] ?? (__mem0[found.entry] = {});
++					const __entry0 = __bucket0[petId] ?? (__bucket0[petId] = { messages: [] });
++					__entry0.messages.length = 0;
++					await writeMemory(__mem0);
++				} catch {}
++				// 小鱼的开场白（3B 造句，小鱼音色）
++				const tplBack = PET_BACK_OPENING;
++				let sayBack = "";
++				try {
++					const sysBack = petSystemPrompt(found)
++						+ "\n\n【这句话用你自己的语气说出来，意思不变，不要解释】" + tplBack;
++					const g = await generateChat(ctx, sysBack, [], tplBack, [], __baseModel);
++					sayBack = String((g && g.text) || "").trim();
++				} catch {}
++				if (sayBack === "") sayBack = tplBack;
++				petPersonaVoice = null;
++				petWhoCache = "xiaoyu";
++				petPersonaVoiceCache = null;
++				try { state.writePet(petId, "anim", { name: "原地小憩沉眠", playbackId: "sw-" + Date.now() }); } catch {}
++				try { petVoicePending.set(petId, {}); } catch {}
++				state.writePet(petId, "say", { text: sayBack });
++				try { memAppend(petId, text, "（人格切换：小鱼）", sayBack, "code"); } catch {}
++				return { ok: true, text: sayBack };
++			}
++
++			// ===== 切到鲸娘 =====
++			const tpl = petPersonaOpening(c.complain);
++			try {
++				state.writePet(petId, "anim", { name: "女仆屈膝礼仪", playbackId: "sw-" + Date.now() });
++			} catch {}
++			let __sys2 = PET_JINGNIANG_PROMPT
++				+ "\n\n【这句话必须用你自己的语气说出来，意思不变，不要解释】" + tpl;
++			if (c.complain) {
++				__sys2 += "\n（顺便抱怨一句：已经 " + c.hours + " 小时没叫我，这期间和小鱼聊了 " + c.turns + " 次）";
++			}
++			let saySw = "";
++			try {
++				const g = await generateChat(ctx, __sys2, [], tpl, [], __jingModel);
++				saySw = String((g && g.text) || "").trim();
++			} catch {}
++			if (saySw === "") saySw = tpl;
++			st.who = "jingniang";
++			st.lastJingniang = __nowSw;
++			st.xiaoyuTurns = 0;
++			petPersonaSave(st);
++			// 鲸娘看得见小鱼刚才聊的，所以这里不清空历史
++			petPersonaVoice = PET_JINGNIANG_VOICE;
++			petWhoCache = "jingniang";
++			petPersonaVoiceCache = PET_JINGNIANG_VOICE;
++			try { petVoicePending.set(petId, { voice: PET_JINGNIANG_VOICE, force: true }); } catch {}
++			state.writePet(petId, "say", { text: saySw });
++			try { memAppend(petId, text, "（人格切换：鲸娘）", saySw, PET_JINGNIANG_MODEL); } catch {}
++			return { ok: true, text: saySw };
++		}
++
+ 		const rounds = memoryRounds(found.conf);
+-		const system = petSystemPrompt(found);
++		// 两层检索：热记忆（3 天）→ 全局；命中才注入
++		// 回忆旧事：范围放大、候选变多、阈值降低，并且先说垫场话
++		const __recall = petIsRecallQuestion(text);
++		if (__recall) {
++			try {
++				state.writePet(petId, "say", { text: petRecallFiller(text) });
++				state.writePet(petId, "anim", { name: "工作状态-思考冒泡", playbackId: "rc-" + Date.now() });
++				petLog("回忆类问题，转深度检索");
++			} catch {}
++		}
++		let memCtx;
++		if (__recall) {
++			const blk = petRecallBlock(text);
++			petLog("时间检索命中 " + blk.count + " 条（" + blk.mode + "）");
++			memCtx = { prompt: blk.prompt, source: "time", count: blk.count };
++		} else {
++			memCtx = await memPromptBlockVector(text, { hotDays: 3, hotTopK: 2, globalTopK: 3, minScore: 0.5, maxChars: 300 });
++		}
++		// 事实层：先把"我叫X"记下来，再决定要不要提示模型怎么回答名字问题
++		const facts = petFactsLoad();
++		const newName = petExtractName(text);
++		const newPhone = petExtractPhone(text);
++		const newBirthday = petExtractBirthday(text);
++		if (newBirthday.text !== "" && newBirthday.text !== facts.birthday) {
++			facts.birthday = newBirthday.text;
++			if (newBirthday.iso) facts.birthdayISO = newBirthday.iso;
++			facts.birthdayAt = new Date().toISOString();
++			petFactsSave(facts);
++			petLog("记住生日：" + newBirthday.text + (newBirthday.iso ? "（" + newBirthday.iso + "）" : ""));
++		}
++		// 【显式记忆】"你要记得…" → 存进 facts.json
++		const rememberBody = petExtractRemember(text);
++		if (rememberBody !== "") {
++			const routed = petStoreRemember(facts, rememberBody);
++			petFactsSave(facts);
++			petLog("记住（" + (routed || "note") + "）：" + rememberBody.slice(0, 40));
++		}
++		if (newPhone !== "" && newPhone !== facts.phone) {
++			facts.phone = newPhone;
++			facts.phoneAt = new Date().toISOString();
++			petFactsSave(facts);
++			petLog("记住主人电话：" + newPhone);
++		}
++		if (newName !== "" && newName !== facts.name) {
++			facts.name = newName;
++			facts.nameAt = new Date().toISOString();
++			petFactsSave(facts);
++			petLog("记住主人名字：" + newName);
++		}
++		const factPrompt = petFactPrompt(facts, petAsksMyName(text));
++		// 反重复：把最近 3 句自己说过的话列出来，明确要求换角度
++		const __recent = memRows().slice(-2).map((r) => String(r.say || "").trim()).filter((x) => x !== "");
++		const avoidPrompt = __recent.length > 0
++			? "" + String.fromCharCode(10, 10) + "【换说法】刚说过：" + __recent.map((x) => "「" + x.slice(0, 24) + "」").join("、") + "。别再重复同样的句式和关键词。"
++			: "";
++		// 人称提醒：每轮都强调一次，3B 模型容易混淆
++		const pronounHint = (/(我|你)/.test(String(text)))
++			? "\n\n【人称提醒】主人这句话里：说「我」=主人自己；说「你」=小鱼（我）。"
++			: "";
++		const songPrompt = petSongPrompt(text);
++		if (songPrompt !== "") petLog("歌曲注入：命中 " + (songPrompt.match(/《/g) || []).length + " 首，长度 " + songPrompt.length);
++		// 时间块：只在主人问到时间相关话题时才注入（用代码判断，不靠提示词）
++		const __timeAsk = /(几点|几号|星期几|礼拜几|今天|明天|后天|昨天|前天|现在是|现在几|多久|早上好|早安|晚安|深夜|凌晨|半夜|熬夜|生日|什么时候|时间不早|几点了|累|困|头疼|头痛|不舒服|难受|疼|痛|饿|失眠|睡不着|腰酸|腰疼|眼睛酸|眼睛疼|感冒|发烧|生病|加班|疲惫|没精神|全身酸)/.test(String(text));
++		const clockBlock = __timeAsk ? petClockBlock(facts) : "";
++		const queryTimeHint = petQueryTimeHint(text);
++		// 【歌词翻页】"下一句/上一句"直接按顺序取，避免方向搞反
++		try {
++			const __step = petLyricStep(text, memRows());
++			if (__step) {
++				let sayStep;
++				if (__step.edge) {
++					sayStep = __step.dir > 0 ? "已经是最后一句啦，主人～" : "这已经是第一句啦，主人～";
++				} else {
++					const tag = __step.dir > 0 ? "下一句" : "上一句";
++					sayStep = tag + "是「" + __step.line + "」呀～";
++				}
++				state.writePet(petId, "say", { text: sayStep });
++				memAppend(petId, text, "（歌词翻页，由代码按顺序取）", sayStep, "code");
++				petLog("歌词翻页：" + (__step.edge ? "到头了" : __step.line.slice(0, 12)));
++				return { ok: true, text: sayStep };
++			}
++		} catch {}
++		let singHintVar = "";
++		// 【最喜欢的歌】排行榜里随机挑前三之一 → 交歌词和歌名给模型组织
++		let favHint = "";
++		let favInfo = null;
++		try {
++			const __asksFav = /(最喜欢|最爱|最喜欢的).{0,6}(歌|曲)|(哪|什么).{0,4}(首).{0,3}(歌|曲)/.test(String(text))
++				&& !/(唱|哼)/.test(String(text));
++			if (__asksFav) {
++				let top = [];
++				try {
++					top = petFavorites(3);
++				} catch (e1) {
++					petLog("读 favorites.json 失败，改用曲库现算：" + (e1 && e1.message));
++				}
++				if (!top || top.length === 0) {
++					// 兜底：直接按 play_count + mentions*3 现算前 3
++					const g = new Map();
++					for (const r of petSongs()) {
++						const k = String(r.canon || r.base_title || r.title || "");
++						if (!k) continue;
++						const cur = g.get(k) || { title: r.base_title || r.title, artist: r.artist || "", play: 0, mentions: 0, lyricsTitle: r.title };
++						cur.play += Number(r.play_count) || 0;
++						cur.mentions += Number(r.mentions) || 0;
++						if (r.lyrics_lrc && r.title) cur.lyricsTitle = r.title;
++						g.set(k, cur);
++					}
++					top = [...g.values()].map((x) => ({ ...x, score: x.play + x.mentions * 3, rank: 0 }))
++						.filter((x) => x.score > 0)
++						.sort((a, b) => b.score - a.score)
++						.slice(0, 3)
++						.map((x, i) => ({ ...x, rank: i + 1 }));
++				}
++				if (top.length === 0) {
++					favHint = "\n\n【她最喜欢哪首歌】还没有听歌记录，老实说：还没怎么一起听过歌，请主人带她听几首。";
++				} else {
++					const pick = top[Math.floor(Math.random() * Math.min(3, top.length))];
++					const __aboutMaster = /主人/.test(String(text));
++					const song = petSongByTitle(pick.lyricsTitle || pick.title);
++					const chorus = song ? petChorusLines(song, 2) : [];
++					favHint = "\n\n【她最喜欢哪首歌（已选定，别改）】"
++						+ "歌名：" + pick.title + (pick.artist ? "（" + pick.artist + "）" : "")
++						+ "；喜爱分：" + Math.round(pick.score) + "（听 " + Math.round(pick.play) + " 次，聊到 " + Math.round(pick.mentions) + " 次）"
++						+ (chorus.length ? "；副歌歌词：" + chorus.join(" / ") : "")
++						+ "\n要求：① 先直接说「" + (__aboutMaster ? "让小鱼猜猜，主人最喜欢的歌应该是" : "小鱼最喜欢的歌是") + pick.title + "」；"
++						+ (chorus.length ? "② 引用上面那两句歌词；" : "")
++						+ "③ 再用你自己的话讲这段给你的感受（讲情绪，不讲来历）；"
++						+ "④ 最后用一句自然的话提到「主人也常听这首」（换个说法，别照抄这句）。";
++					favInfo = { title: pick.title, chorus, alt: pick.lyricsTitle, subject: __aboutMaster ? "master" : "self" };
++					petLog("最喜欢的歌：随机挑中 #" + pick.rank + " " + pick.title);
++					// 记一次"聊到"
++					try { petSongMention(petId, song || { title: pick.lyricsTitle }); } catch {}
++				}
++			}
++		} catch (e0) { petLog("最喜欢的歌注入失败：" + (e0 && e0.message)); }
++
++		// 【唱歌】代码挑歌词 → 模型只负责唱出来 + 补一句感受
++		try {
++			const __wantsSing = /唱|哼|来一段|来一首|唱两句/.test(String(text || ""));
++			if (__wantsSing) {
++				const __hits = petFindSongs(text, 1);
++				const __song = __hits.length > 0 ? __hits[0].r : null;
++				if (!__song) {
++					const sayNoSong = "主人想听哪一首呀～";
++					state.writePet(petId, "say", { text: sayNoSong });
++					memAppend(petId, text, "（想唱但没找到歌）", sayNoSong, "code");
++					return { ok: true, text: sayNoSong };
++				}
++				const __lyr = petLyricLines(__song);
++				if (__lyr.length === 0) {
++					const sayNoLyr = "这首小鱼只记得旋律，词记不全啦…主人换一首？";
++					state.writePet(petId, "say", { text: sayNoLyr });
++					memAppend(petId, text, "（这首歌没歌词）", sayNoLyr, "code");
++					return { ok: true, text: sayNoLyr };
++				}
++				// 从上次唱到的位置往后挑 2 行；没唱过就从开头
++				let idx = petLastQuotedIndex(memRows(), __song);
++				if (idx < 0 || idx + 2 >= __lyr.length) idx = 0;
++				const __pick = __lyr.slice(idx, idx + 2);
++				const singHint = "\n\n【唱这段（已经挑好了，别改词）】" + __pick.join(" / ")
++					+ "\n要求：① 这两句要唱出来（用「」包住也可以）；"
++					+ "② 不要报歌名、歌手、版本、专辑；"
++					+ "③ 唱完之后用一句话讲你对这段的感受（讲情绪，不讲来历，不许编年份/作者/奖项）。";
++				// 记一次"聊到"（喜爱度用）
++				petSongMention(petId, __song);
++				// 交给下面的模型生成（把 singHint 拼进 system）
++				singHintVar = singHint;
++			}
++		} catch {}
++		// 【算术】代码算结果 → 交给模型造句（可结合上下文和特殊数字） → 交给模型造句（可结合上下文和特殊数字）
++		const __arith = petParseArithmetic(text);
++		let arithHint = "";
++		let arithInfo = null;
++		if (__arith && __arith.failed) {
++			const sayBad = "唔…这题小鱼算不出来，主人换个数字或者说法嘛～";
++			state.writePet(petId, "say", { text: sayBad });
++			memAppend(petId, text, "（算术题，代码无法解析）", sayBad, "code");
++			return { ok: true, text: sayBad };
++		}
++		if (__arith) {
++			const __val = petArithValue(__arith);
++			arithInfo = { text: petArithAnswer(__arith), value: __val };
++			const special = [];
++			if (__val === 520 || __val === 521) special.push("520（我爱你）");
++			if (__val === 1314) special.push("1314（一生一世）");
++			if (__val === 1314520 || __val === 1314521) special.push("1314520（一生一世我爱你）");
++			if (__val === 99 || __val === 999 || __val === 9999) special.push(String(__val) + "（长长久久）");
++			// 和 facts.json 里存的所有数字比一遍
++			try {
++				for (const kn of petFactsNumbers(facts)) {
++					if (String(__val) === kn.num) special.push("「" + kn.num + "」是" + kn.label);
++				}
++			} catch {}
++			arithHint = "\n\n【算术（结果已算好）】" + arithInfo.text
++				+ (special.length > 0 ? "\n这个数字很特别：" + special.join("、") + "，可以顺口提一句（比如「这数字真特别呀」）。" : "")
++				+ "\n要求：先来一句「让小鱼算算…」，再说出结果；必须用算好的数字，不要改、不要重新计算。";
++		}
++		// 【年龄】代码算数，模型组织语言；算不出来才直接兜底
++		let ageHint = "";
++		let ageInfo = null;
++		if (petAsksAge(text)) {
++			ageInfo = petAgeInfo(facts);
++			if (ageInfo.days < 0) {
++				state.writePet(petId, "say", { text: ageInfo.sentence });
++				memAppend(petId, text, "（年龄问题，由代码直接回答）", ageInfo.sentence, "code");
++				return { ok: true, text: ageInfo.sentence };
++			}
++			ageHint = "\n\n【年龄计算（已算好，直接用）】我到今天陪伴主人 " + ageInfo.days + " 天，" + ageInfo.age + " 岁。"
++				+ "\n要求：先来一句「让小鱼算算…」，再自然地说出这个数字；必须用 " + ageInfo.days + " 天"
++				+ (ageInfo.age > 0 ? "（或 " + ageInfo.age + " 岁）" : "") + "，绝不改数、不说「大约」。";
++		}
++		// 【身份】她经常把"小鱼"当成主人在叫 —— 这里明确：小鱼就是她自己
++		// 【身份】防止她把“小鱼”当成主人在叫（用 fromCharCode 避免转义问题）
++		const __NL = String.fromCharCode(10);
++		const identityHint = __NL + __NL + "【你是谁（必须记住）】" + __NL + "你叫小鱼（蓝毛小女仆）。「小鱼」永远指你自己。" + __NL + "主人叫你「小鱼」，是在叫你，不是在叫别人。" + __NL + "你称呼对方只能叫「主人」，绝不能反过来叫她「小鱼」。" + __NL + "说错的样子（禁止）：「我们一起加油哦小鱼」「小鱼，你听我说」" + __NL + "说对的样子：「主人，我们一起加油嘛」「小鱼在这儿呢，主人」";
++		const __asksIdentity = petAsksIdentity(text);
++		const __identity = __asksIdentity ? petIdentityFact(facts) : null;
++		let identityFactHint = "";
++		if (__identity) {
++			if (__identity.known) {
++				identityFactHint = "\n\n【身份事实（已确定）】" + __identity.fact
++					+ "主人问的是她自己是谁。\n要求：直接告诉主人「你是" + String(facts.name || "") + "」，不要自我介绍，不要说你自己是谁。";
++			} else {
++				identityFactHint = "\n\n【身份事实（已确定）】" + __identity.fact
++					+ "\n要求：告诉主人「你就是主人」，并说明你还没被告知她的名字；不要自我介绍。";
++			}
++		}
++		const modelText = (__asksIdentity || petPersonaState().who === "jingniang") ? text : petPronounTranslate(text);
++		petPersonaVoice = petPersonaState().who === "jingniang" ? PET_JINGNIANG_VOICE : null;
++		petWhoCache = petPersonaState().who;
++		petPersonaVoiceCache = petPersonaVoice;
++		const __basePersona = petPersonaState().who === "jingniang" ? PET_JINGNIANG_PROMPT : petSystemPrompt(found);
++		// 单向记忆：鲸娘能看到小鱼刚才聊的，但她要知道那不是自己说的
++		let jingHistoryHint = "";
++		if (petPersonaState().who === "jingniang") {
++			jingHistoryHint = String.fromCharCode(10) + String.fromCharCode(10) + "【提醒】如果历史记录里有最近几轮，那是你沉睡时小鱼和主人说的，不是你说过的；别当成自己的话。";
++		}
++		const __isJing = petPersonaState().who === "jingniang";
++		petLog("提示词长度：" + (__basePersona.length + jingHistoryHint.length + clockBlock.length + memCtx.prompt.length
++			+ factPrompt.length + songPrompt.length + queryTimeHint.length + identityFactHint.length + avoidPrompt.length) + " 字（" + (petPersonaState().who) + "）");
++		const system = __basePersona + jingHistoryHint + factPrompt + songPrompt + memCtx.prompt + clockBlock +
++			queryTimeHint + (__isJing ? "" : pronounHint) + ageHint + arithHint + singHintVar + favHint +
++			identityFactHint + avoidPrompt + (__isJing ? "" : identityHint);
++		// 【快速通道】问"我叫什么/我是谁"：直接答，不交给模型。
++		// 3B 会把这个问题的答案搞成自己的名字，提示词和事实注入都纠正不过来。
++		// 【快速通道】问生日：代码直接答，不靠模型"回忆"
++		if (petAsksBirthday(text) && newBirthday.text === "") {
++			const say3 = facts.birthday
++				? "我的生日是" + facts.birthday + "呀，主人给的特别日子，我一直记着呢～"
++				: "唔…主人还没给我定过生日呢，要不今天就是？";
++			state.writePet(petId, "say", { text: say3 });
++			memAppend(petId, text, "（生日问题，由代码直接回答）", say3, "code");
++			return { ok: true, text: say3 };
++		}
++		// 【快速通道】问电话号码：同样交给代码，别让模型瞎编
++		if (petAsksPhone(text) && newPhone === "") {
++			const say2 = facts.phone
++				? "主人的号码是" + facts.phone + "呀，我记着呢～"
++				: "唔…主人还没把号码告诉我呢，说给我听嘛～";
++			state.writePet(petId, "say", { text: say2 });
++			memAppend(petId, text, "（电话问题，由代码直接回答）", say2, "code");
++			return {
++				ok: true,
++				text: say2
++			};
++		}
++		if (petAsksMyName(text) && newName === "") {
++			// 【快速通道】问主人自己的名字：只认 facts.json，绝不编
++			const sayName = facts.name
++				? "主人叫做" + facts.name + "嘛～"
++				: "主人就是主人嘛，不过主人还没告诉我主人的名字呢～";
++			state.writePet(petId, "say", { text: sayName });
++			memAppend(petId, text, "（名字问题，由代码直接回答）", sayName, "code");
++			return { ok: true, text: sayName };
++		}
+ 		const pool = found.conf.chatImageEnabled === true ? limitPool(readMemePool(found.conf.memes, memeDirsFor(found.entry)), Number(found.conf.chatImageLimit)) : [];
+ 		const mem = await readMemory();
+ 		const bucket = mem[_found$entry = found.entry] ?? (mem[_found$entry] = {});
+ 		const entry = bucket[petId] ?? (bucket[petId] = { messages: [] });
+-		const list = sliceMemoryRounds(entry.messages, rounds);
+-		const generated = await generateChat(ctx, system, list, text, pool, configuredModel(found.conf, "chatModel"));
++		const __rounds = petHistoryRounds(rounds, text);
++		const list = sliceMemoryRounds(entry.messages, __rounds);
++		// 流式分句：模型还在写的时候，第一句完整就送去合成，缩短"听到声音"的等待
++		let __spokenLen = 0;
++		let __streamedAny = false;
++		const __speakChunk = (partialText) => {
++			try {
++				const m = String(partialText).match(/<说>([\s\S]*)$/);
++				if (!m) return;
++				let say = m[1].replace(/<\/说>[\s\S]*$/, "");
++				// 按句末标点切，保留标点
++				const parts = say.split(/(?<=[。！？!?～~…])\s*/);
++				if (parts.length === 0) return;
++				// 末尾还有半句就先不说；但只要有完整句子就立刻说，不用等第二句
++				const done = (parts.length > 1 ? parts.slice(0, -1).join("") : (/[。！？!?～~…]\s*$/.test(say) ? say : "")).trim();
++				if (done === "") return;
++				if (done.length <= __spokenLen) return;
++				const fresh = done.slice(__spokenLen).trim();
++				__spokenLen = done.length;
++				const clean = petSpeechText(fresh);
++				if (clean !== "") {
++					__streamedAny = true;
++					// 流式分句也要用当前人格的音色（鲸娘时不能出小鱼声）
++					const __pwho2 = petPersonaState().who;
++					speakPetLine(clean, __pwho2 === "jingniang" ? { force: true, voice: PET_JINGNIANG_VOICE } : { force: true });
++				}
++			} catch {}
++		};
++		const __t0 = Date.now();
++		let __chunks = 0;
++		if (modelText !== text) petLog("人称翻译：" + text.slice(0, 20) + " → " + modelText.slice(0, 24));
++		{
++			const __pm = petPersonaModel(found);
++			petLog("对话模型：" + (__pm ? __pm.provider + "/" + __pm.model : "默认"));
++		}
++		const generated = await generateChat(ctx, system, list, modelText, pool, petPersonaModel(found), (partial) => {
++			if (__chunks === 0) petLog("流式首块 " + (Date.now() - __t0) + "ms");
++			__chunks++;
++			__speakChunk(partial);
++		});
++		petLog("流式结束：收到 " + __chunks + " 块，用时 " + (Date.now() - __t0) + "ms，提前分句 " + (__streamedAny ? "是" : "否") + "，spokeLen=" + __spokenLen);
+ 		if (!generated.ok) return generated;
++		// 拆出「内心想法」和「台词」：只有台词会被显示/念出来
++		let parts = splitThinkSay(generated.text);
++		if (parts.tagged && parts.say !== "") generated.text = parts.say;
++		generated.text = petStripLabels(generated.text);
++		// 清掉结尾/开头残留的标签（模型偶尔漏出 </说>、<说>、[说] 之类）
++		try {
++			let tt = String(generated.text);
++			const beforeTag = tt;
++			tt = tt.replace(/[<＜\[【]\s*\/?\s*(说|想|\/说|\/想)\s*[>＞\]】]/g, "");
++			// 残缺标签：>说>、说>、<说、</说 之类
++			tt = tt.replace(/[<＞>]?\s*\/?\s*(说|想)\s*[>＞]/g, "").replace(/[<＜]\s*\/?\s*(说|想)/g, "");
++			tt = tt.replace(/^[\s，,。.、！!？?～~]+/, "").replace(/[\s]+$/, "");
++			// 鲸娘：把过长的句子按逗号拆短（她的人设要求"句子短、句数多"）
++			try {
++				if (petPersonaState().who === "jingniang") {
++					tt = tt.split(/(?<=[。！？!?])/).map((seg) => {
++						if (seg.length <= 16) return seg;
++						const tail = seg.slice(-1);
++						const body = /[。！？!?]/.test(tail) ? seg.slice(0, -1) : seg;
++						const parts = body.split("，").map((x) => x.trim()).filter((x) => x !== "");
++						if (parts.length < 2) return seg;
++						return parts.map((x) => x + "。").join("").replace(/。$/, /[。！？!?]/.test(tail) ? tail : "。");
++					}).join("");
++				}
++			} catch {}
++			// 叠称清理：「你小鱼」→「小鱼」、「你小道士」→「小道士」
++			tt = tt.replace(/(?<!小鱼)你小鱼/g, "小鱼").replace(/你小道士/g, "小道士");
++			if (tt !== beforeTag && tt.trim() !== "") {
++				petLog("清掉残留标签");
++				generated.text = tt;
++			}
++		} catch {}
++
++		// 【身份纠错】她把"小鱼"当成主人在叫时，改回"主人"
++		// 判据：小鱼出现在句尾/句首作为称呼，或紧跟在 哦/啊/呀/，之后
++		try {
++			let t2 = String(generated.text);
++			const before = t2;
++			// 句尾称呼：「…加油哦小鱼。」「…辛苦啦，小鱼」
++			t2 = t2.replace(/[，,、]?\s*小鱼\s*([。！？!?～~]|$)/g, "主人$1");
++			// 句首称呼：「小鱼，你听我说」
++			t2 = t2.replace(/^\s*小鱼\s*[，,、]/g, "主人，");
++			// 中间：「谢谢小鱼」「叫小鱼」
++			t2 = t2.replace(/(谢谢|叫|问|告诉|陪|让|帮)\s*小鱼/g, "$1主人");
++			if (t2 !== before) {
++				petLog("身份纠错：把误用的「小鱼」改成「主人」");
++				generated.text = t2;
++			}
++		} catch {}
++
++		// 把"歌词：歌名"这类把标题当歌词的写法删掉；清掉 〈说〉〈想〉 残留
++		try {
++			let out = String(generated.text);
++			const before = out;
++			out = out.replace(/[〈<]\s*(说|想|\/说|\/想)\s*[〉>]/g, "");
++			out = out.replace(/歌词\s*[:：]\s*[^。！？\n]{0,40}/g, "");
++			out = out.replace(/(?:这句|这句歌)?歌词是\s*[《「]?[^，。！？\n]{0,20}[》」]?[，,。]?/g, "");
++			out = out.replace(/\s{2,}/g, " ").replace(/^[，,。.、\s]+/, "").trim();
++			if (out !== "" && out !== before) {
++				petLog("清掉把歌名当歌词的写法");
++				generated.text = out;
++			}
++		} catch {}
++
++		// 唱歌时：不许念书名号、歌手、版本、来历
++		try {
++			if (/唱|哼|来一段|来一首/.test(String(text))) {
++				let out = String(generated.text);
++				const before = out;
++				out = out.replace(/《[^》]{1,30}》/g, "");
++				out = out.replace(/[（(][^）)]{1,12}(版|伴奏|live|Live|Cover|cover|翻唱|remix)[^）)]{0,10}[）)]/g, "");
++				out = out.replace(/(演唱|歌手|专辑|作词|作曲|编曲|原唱|发行|出品)\s*[:：]?\s*[^，。！？\s]{0,16}/g, "");
++				out = out.replace(/\s{2,}/g, " ").replace(/^[，,。.、\s]+/, "").trim();
++				if (out !== "") {
++					if (out !== before) petLog("唱歌时删掉了歌名/歌手/版本");
++					generated.text = out;
++				}
++			}
++		} catch {}
++
++		// 主人没聊歌，却把歌词/歌名念出来了 → 删掉
++		try {
++			const __asksSong = /歌|歌词|唱|哼|曲|下一句|上一句|前一句/.test(String(text));
++			if (!__asksSong) {
++				let out = String(generated.text);
++				const before = out;
++				out = out.replace(/《[^》]{1,20}》(\s*[-—–]\s*[^，。！？\s]{1,20})?/g, "");
++				out = out.replace(/「[^」]{6,60}」/g, "");
++				out = out.replace(/[^，。！？\s]{0,6}能记住的歌词[^，。！？]*[，。！？]?/g, "");
++				out = out.replace(/\s{2,}/g, " ").replace(/^[，,。.、\s]+/, "").trim();
++				if (out !== "" && out !== before) {
++					petLog("删掉未经请求的歌词/歌名");
++					generated.text = out;
++				}
++			}
++		} catch {}
++
++		// 最喜欢的歌：台词里必须有歌名，否则用代码句子兜底
++		if (favInfo) {
++			const said3 = String(generated.text);
++			if (!said3.includes(favInfo.title) && !said3.includes(favInfo.alt || "")) {
++				petLog("最喜欢的歌没说出歌名，改用代码兜底");
++				const line = favInfo.chorus && favInfo.chorus.length
++					? "「" + favInfo.chorus[0] + "」"
++					: "";
++				const __head = favInfo.subject === "master"
++					? "让小鱼猜猜…主人最喜欢的歌应该是《" + favInfo.title + "》呀～"
++					: "小鱼最喜欢的歌是《" + favInfo.title + "》呀～";
++				generated.text = __head
++					+ (line ? "这句" + line + "总让小鱼心里软软的。" : "")
++					+ (favInfo.subject === "master" ? "" : "主人不是也常听这首嘛～");
++			}
++		}
++		// 身份问题：回答里必须有"主人"，否则用代码句子兜底
++		if (__identity) {
++			const saidId = String(generated.text);
++			const okId = saidId.includes("主人") || (__identity.known && saidId.includes(String(facts.name || " ")));
++			if (!okId) {
++				petLog("身份回答没提到主人，改用代码兜底");
++				generated.text = __identity.fallback;
++			}
++		}
++		// 算术题：台词里必须出现算好的数字
++		if (arithInfo && Number.isFinite(arithInfo.value)) {
++			const said2 = String(generated.text);
++			const valStr = String(arithInfo.value);
++			const valStr2 = valStr.replace(/\.0+$/, "");
++			if (!said2.includes(valStr) && !said2.includes(valStr2)) {
++				petLog("算术回答没带数字，改用代码兜底");
++				generated.text = arithInfo.text;
++			}
++		}
++		// 年龄问题：台词里必须出现算好的数字，否则用代码句子兜底
++		if (ageInfo && ageInfo.days >= 0) {
++			const said = String(generated.text);
++			const hasNum = said.includes(String(ageInfo.days)) || (ageInfo.age > 0 && said.includes(String(ageInfo.age)));
++			if (!hasNum) {
++				petLog("年龄回答没带数字，改用代码兜底");
++				generated.text = ageInfo.sentence;
++			}
++		}
++		// 【兜底】模型只写想法不写台词时，去掉格式要求重新生成一次（不带 <想> 预填）
++		if (petSpeechText(String(generated.text)) === "") {
++			try {
++				const plainSystem = system.replace(/【输出格式】[\s\S]*$/, "").replace(/先写内心想法[:：][\s\S]*$/, "");
++				const retry = await generateChat(ctx, plainSystem, list, modelText, pool, petPersonaModel(found));
++				if (retry.ok && petSpeechText(String(retry.text)) !== "") {
++					generated.text = String(retry.text);
++					parts = splitThinkSay(generated.text);
++					if (parts.tagged && parts.say !== "") generated.text = parts.say;
++					petLog("空台词已用重生成兜底");
++				}
++			} catch {}
++		}
++		// 还是空：给一句不会错的兜底，绝不明着沉默
++		if (petSpeechText(String(generated.text)) === "") {
++			generated.text = facts.name ? "唔…我一时没想好该怎么回主人呢。" : "唔…这个我还真不知道，主人别嫌我笨嘛～";
++		}
++		// 【开头复读】把上一句的开头原样搬过来的情况，切掉那段前缀
++		// 关键：只在标点处切，绝不切进词中间（曾把「主人」切成「人」）
++		{
++			try {
++				const __recent = (entry.messages ?? []).filter((m) => m && m.role === "assistant")
++					.slice(-3).map((m) => String(m.content || ""));
++				const __firstClause = (t) => (String(t).split(/[。！？!?～~\n]/)[0] || "").trim();
++				let __cur = String(generated.text).trim();
++				const __norm = (x) => String(x || "").replace(/[\s，。！？、：:；“”"'（）()《》…—~～]/g, "");
++				const __PUNCT = /[，。！？、；：\n]/;
++				const __OPENERS = ["让小鱼算算", "想起来了呢", "唔我想想", "让我想想"];
++				const __isOpener = (x) => __OPENERS.some((o) => __norm(x).startsWith(__norm(o)));
++				const __orig = __cur;
++
++				for (const prev of __recent.concat([String((memRows().slice(-1)[0] || {}).say || "")])) {
++					const pc = __firstClause(prev);
++					if (pc.length < 6) continue;
++					if (__isOpener(__cur)) break;
++					const headN = __norm(pc).slice(0, 6);
++					const curN = __norm(__cur);
++					if (headN.length < 4 || !curN.startsWith(headN)) continue;
++
++					// 找到"前 6 个实字"结束的位置
++					let cnt = 0, cut = 0;
++					for (let i = 0; i < __cur.length; i++) {
++						if (!/[\s，。！？、：:；“”"'（）()《》…—~～]/.test(__cur[i])) cnt++;
++						if (cnt === headN.length) { cut = i + 1; break; }
++					}
++					// ② 向后推到最近的标点，保证不在词中间断
++					let k2 = cut;
++					while (k2 < __cur.length && k2 - cut < 12 && !__PUNCT.test(__cur[k2])) k2++;
++					if (k2 >= __cur.length || k2 - cut >= 12) continue;   // 找不到标点 → 不切
++					const cutAt = k2 + 1;
++
++					// ④ 数字保护
++					const nx = __cur[cutAt] || "";
++					const pv = __cur[cutAt - 1] || "";
++					if (/[0-9０-９]/.test(nx) || /[0-9０-９]/.test(pv)) continue;
++
++					const tail = __cur.slice(cutAt).replace(/^[，,。.、！!？?～~\s]+/, "").trim();
++					// ③ 剩下太少 → 不切
++					if (tail.length < 4) continue;
++					// ⑤ 最多切 40%
++					if (cutAt > __orig.length * 0.4) continue;
++
++					petLog("去掉开头复读（标点处切）：" + __cur.slice(0, cutAt).slice(0, 16));
++					__cur = tail;
++					break;
++				}
++				if (__cur !== __orig) generated.text = __cur;
++			} catch {}
++		}
++		// 【防复读】和上一次回复太像就重生成一次（明确要求换说法）
++		{
++			try {
++				const __rows = memRows();
++				const __prevSay = __rows.length > 0 ? String(__rows[__rows.length - 1].say || "") : "";
++				const __th = petRepeatThreshold(petPersonaState().who, __prevSay, generated.text);
++				const __ratio = petRepeatRatio(generated.text, __prevSay);
++				if (__prevSay !== "") {
++					petLog("复读判定：重合 " + Math.round(__ratio * 100) + "% / 阈值 " + Math.round(__th * 100)
++						+ "%（" + petPersonaState().who + "，上句 " + __prevSay.length + " 字）→ "
++						+ (__ratio > __th ? "判复读" : "保留")
++						+ " | 上句:" + __prevSay.slice(0, 24) + " | 新句:" + String(generated.text).slice(0, 24));
++				}
++				if (__prevSay !== "" && __ratio > __th) {
++					petLog("检测到复读，重生成一次");
++					const __anti = system + "\n\n【换说法】你上一次回答是：「" + __prevSay.slice(0, 40) + "」。这次必须换一种措辞和角度，不要重复那句，也不要只换个别词。";
++					const __retry = await generateChat(ctx, __anti, list, modelText, pool, petPersonaModel(found));
++					if (__retry.ok) {
++						const __p2 = splitThinkSay(__retry.text);
++						const __say2 = __p2.tagged && __p2.say !== "" ? __p2.say : String(__retry.text);
++						if (!petTooSimilar(__say2, __prevSay)) {
++							generated.text = __say2;
++							parts = __p2;
++						}
++					}
++				}
++			} catch {}
++		}
++		// 台词开头把想法原样复述了一遍 → 去掉（3B 常见毛病）
++		{
++			const th = String(parts.think || "").trim();
++			if (th.length >= 6) {
++				const heads = [th, th.replace(/[。！？!?～~，,]$/, "")];
++				for (const h of heads) {
++					if (h !== "" && String(generated.text).trim().startsWith(h)) {
++						generated.text = String(generated.text).trim().slice(h.length).replace(/^[，,。.！!？?～~s]+/, "").trim();
++						break;
++					}
++				}
++			}
++		}
++		// 正文里不允许出现标记：模型可能漏掉配对或表情包名不在池里
++		{
++			const markerName = (String(generated.text).match(/\[图[:：]\s*([^\]]*)\]/) || [])[1];
++			let clean = String(generated.text)
++				.replace(/[\[【]?\s*图\s*[:：]\s*[^\]】\n]*[\]】]?/g, "")
++				.replace(/[\[【]\s*配图\s*[\]】]/g, "")
++				.replace(/^\s*[\[【]\s*(说|想)\s*[\]】]\s*/g, "")
++				.replace(/[\[【]\s*\/\s*(说|想)\s*[\]】]/g, "")
++				.replace(/[\[\]【】]/g, " ")
++				.replace(/<\/?\s*(说|想)\s*>/g, " ")
++				.replace(/&lt;\/?\s*(说|想)\s*&gt;/gi, " ")
++				.replace(/&[a-z]+;/gi, " ")
++				.replace(/(^|\s)(说|想)>\s*/g, "$1")
++				.replace(/\s{2,}/g, " ")
++				.trim();
++			// 表情包名字是从"配图清单"里学来的，模型会把它们当台词念（"深度睡眠""大烧货"）
++			try {
++				for (const mm of pool) {
++					if (mm && mm.name) clean = clean.split(String(mm.name)).join(" ");
++				}
++				clean = clean.replace(/\s{2,}/g, " ").trim();
++			} catch {}
++			if (clean === "") clean = ""; // 只有图就只出图，不再用图名充当台词
++			generated.text = clean;
++		}
++		memAppend(petId, text, parts.think, generated.text, (petPersonaModel(found) && petPersonaModel(found).model) || "?");
++		try {
++			const __ps = petPersonaState();
++			if (__ps.who === "xiaoyu") { __ps.xiaoyuTurns = (Number(__ps.xiaoyuTurns) || 0) + 1; petPersonaSave(__ps); }
++		} catch {}
++		// 已经通过流式分句说过一部分：让下面的 writePet 不要再整句念一遍
++		let __pendingSpeech = null;
++		if (__streamedAny) {
++			const rest = petSpeechText(String(generated.text).slice(__spokenLen).trim());
++			if (rest !== "") { try { speakPetLine(rest, { force: true }); } catch {} }
++			__pendingSpeech = { silent: true };
++		}
++		if (__pendingSpeech) petVoicePending.set(petId, __pendingSpeech);
++		else {
++			try {
++				const __pwho = petPersonaState().who;
++				petVoicePending.set(petId, __pwho === "jingniang" ? { voice: PET_JINGNIANG_VOICE } : {});
++			} catch {}
++		}
++		if (memCtx.count > 0) petLog("记忆命中 " + memCtx.count + " 条（" + memCtx.source + "）");
+ 		const now = Date.now();
+ 		entry.messages.push({
+ 			role: "user",
+@@ -4126,10 +6774,40 @@
+ 			ts: now
+ 		});
+ 		await writeMemory(mem);
++		try {
++			if (petPersonaState().who === "xiaoyu") {
++				setTimeout(() => { petWarmJingniang(ctx, found).catch(() => null); }, 2500).unref?.();
++			}
++		} catch {}
+ 		state.writePet(petId, "say", generated.image ? {
+ 			text: generated.text,
+ 			image: generated.image
+ 		} : { text: generated.text });
++		// 【说完再校对】它已经把话说出来了。这里判断是否跑题，
++		// 跑题就再补一句（气泡更新为完整话，语音只念补充的那句）。
++		// 【说完再校对】——必须异步：接口要立刻回话，否则客户端会超时（对话响应非法）。
++		// 后台任务：等它把话说完 → 冒个思考动作 → 判断是否跑题 → 需要就补一句。
++		const __draftSay = petSpeechText(String(generated.text));
++		const __asks = /[?？]|(吗|吧|呢)\s*$|(帮我|给我|请你|告诉我|多少|几点|怎么|什么|为什么|能不能|是不是|会不会|行不行)/.test(String(text));
++		if (__draftSay !== "" && !generated.image && __asks) {
++			const __before = petSpeechCount();
++			const __jobPet = petId;
++			const __jobText = String(text);
++			void (async () => {
++				try {
++					await petWaitPlayback(__before, 30000);
++					try { state.writePet(__jobPet, "anim", { name: "工作状态-思考冒泡", playbackId: "sr-" + Date.now() }); } catch {}
++					const __fix = await petSelfRepair(ctx, __jobText, __draftSay, found.conf, __jobPet);
++					if (__fix !== "") {
++						petLog("跑题补救：" + __fix);
++						const __full = __draftSay.replace(/[\s。！？!?～~]+$/, "") + "，" + __fix;
++						petVoicePending.set(__jobPet, { silent: true });
++						state.writePet(__jobPet, "say", { text: __full });
++						try { speakPetLine(__fix, { force: true }); } catch {}
++					}
++				} catch {}
++			})();
++		}
+ 		return {
+ 			ok: true,
+ 			text: generated.text,
+@@ -4287,6 +6965,8 @@
+ 			return;
+ 		}
+ 		const origin = `http://127.0.0.1:${port}`;
++		// 把端口写到文件，供语音输入脚本调用（它们动态找端口不可靠）
++		try { mkdirSync(join(PET_VOICE_DIR, "corpus"), { recursive: true }); writeFileSync(join(PET_VOICE_DIR, "corpus", "host-port.txt"), String(port), "utf8"); } catch {}
+ 		const siteUrl = ctx.connection.authenticatedUrl(origin);
+ 		const configUrl = `${origin}${ROUTE_PREFIX}/config`;
+ 		helper = new HelperProcess({
+@@ -4998,6 +7678,55 @@
+ 				};
+ 			}
+ 		}
++		if (rest === "bgm-prep") {
++			// 页面在动画开始播时调用：lead = 距片尾还有多久（毫秒）
++			const lead = Number(url.searchParams.get("lead") ?? "0");
++			// BGM 现在由发声进程在问候播放时直接播，这里只记一笔
++			const started = true;
++			try { writeFileSync(join(PET_VOICE_DIR, "corpus", "greet-hits.log"), new Date().toISOString() + " bgm-prep lead=" + String(lead) + " started=" + String(started) + "\n", { encoding: "utf8", flag: "a" }); } catch {}
++			return { kind: "json", status: 200, obj: { ok: true, started } };
++		}
++		if (rest === "bgm-cancel") {
++			// 用户跳过动画：把还没开播的 BGM 助手撤掉
++			try { if (petBgmChild !== null) { petBgmChild.kill(); petBgmChild = null; } } catch {}
++			return { kind: "json", status: 200, obj: { ok: true } };
++		}
++		if (rest === "greet-now") {
++			// GET（图片信标）与 POST 都接受；记一笔命中方便排查
++			try { writeFileSync(join(PET_VOICE_DIR, "corpus", "greet-hits.log"), new Date().toISOString() + " " + method + "\n", { encoding: "utf8", flag: "a" }); } catch {}
++			// 动画可能比生成还快（最短片子 8 秒）：等生成结果，最多 8 秒
++			if (petGreetingReady === null && petGreetingTask !== null) {
++				try { await Promise.race([petGreetingTask, new Promise((r) => setTimeout(r, 8e3))]); } catch {}
++			}
++			const spoke = speakGreeting();
++			return { kind: "json", status: 200, obj: { ok: true, spoke } };
++		}
++		if (rest === "client-build") {
++			try {
++				petLog("client 构建上报: " + (url.searchParams.get("b") || "?"));
++			} catch {}
++			return { kind: "json", status: 200, obj: { ok: true } };
++		}
++		if (rest === "voice-draft") {
++			if (method === "POST") {
++				let obj = null;
++				try { obj = JSON.parse(body ?? "null"); } catch {}
++				const text = obj && typeof obj.text === "string" ? obj.text.slice(0, 500) : "";
++				petVoiceDraft = text;
++				try { petLog("草稿写入: " + (text === "" ? "(清空)" : text.slice(0, 24))); } catch {}
++				// 直接把草稿写进她说的话那种气泡（不发声），这样不用改客户端也能"边说你边看到字"
++				try {
++					if (text !== "") {
++						const __list = desktopPetList();
++						const __pid = __list.length > 0 ? __list[0].id : "main";
++						petVoicePending.set(__pid, { silent: true });
++						state.writePet(__pid, "say", { text: text });
++					}
++				} catch {}
++				return { kind: "json", status: 200, obj: { ok: true, text } };
++			}
++			return { kind: "json", status: 200, obj: { ok: true, text: petVoiceDraft } };
++		}
+ 		if (rest === "broadcast") {
+ 			if (method !== "POST") return {
+ 				kind: "json",
+@@ -5061,6 +7790,10 @@
+ 				const blocked = lockBlocked(d.petId, url.searchParams);
+ 				if (blocked) return blocked;
+ 				const pic = d.url !== void 0 ? { url: d.url } : d.image !== void 0 ? { image: d.image } : {};
++				// 新增：o.speak === true 时同时出声（走 say 链路，气泡+语音）
++				if (o.speak === true && typeof d.text === "string" && d.text !== "") {
++					state.writePet(d.petId, "say", { text: d.text });
++				}
+ 				state.writePet(d.petId, "say", {
+ 					text: d.text,
+ 					...pic,
+@@ -5947,8 +8680,18 @@
+ 		state.cancelAll();
+ 		stopHelper("dsh-host-stop");
+ 	});
++	// 本地模型服务跟随 DSH：启动时拉起，退出时关闭
++	// Ollama 现在跟开机自启（D:\dsh-tools\start-ollama.ps1 + HKCU Run），
++	// DSH 退出时不再关它；这里只保留"没跑就顺手拉起"的兜底。
++	ctx.effect(() => {
++		void ensureOllamaServer();
++		return () => {};
++	}, "dsh-pet: local ollama lifecycle");
+ 	startHelper();
+ }
+ 
+ //#endregion
+-export { apply, inject, name };
+\ No newline at end of file
++process.once("exit", () => {
++	try { shutdownOllamaServer(); } catch {}
++});
++export { apply, inject, name };
