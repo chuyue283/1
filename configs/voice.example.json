@@ -1,0 +1,21 @@
+{
+  "enabled": true,
+  "engine": "fish",
+  "fishVoice": "<小鱼音色ID>",
+  "greetingVoice": "<鲸娘音色ID>",
+  "fishModel": "s2.1-pro-free",
+  "proxy": "http://127.0.0.1:7890",
+  "rate": 1.0,
+  "greetingText": "这里是深海女仆工坊，欢迎回来",
+  "greetingSpeed": 0.82,
+  "bgm": {
+    "enabled": true,
+    "file": "<背景音乐文件路径，可为 mp4>",
+    "start": 3,
+    "ratio": 0.2,
+    "fadeMs": 3500,
+    "holdMs": 0,
+    "leadMs": 800,
+    "tailMs": 0
+  }
+}
