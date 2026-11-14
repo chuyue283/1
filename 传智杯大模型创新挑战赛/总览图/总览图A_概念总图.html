@@ -1,0 +1,109 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  width: 1600px; height: 1000px; overflow: hidden;
+  font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+  background: #050810; color: #e8eefc;
+}
+.stage { position: relative; width: 1600px; height: 1000px; }
+.footer {
+  position: absolute; left: 0; right: 0; bottom: 18px; text-align: center;
+  font-size: 13px; color: rgba(200,215,240,.45); letter-spacing: 2px;
+}
+
+body { background: radial-gradient(circle at 50% 0%, #0d1a33 0%, #060a14 55%, #04060c 100%); }
+.head { position:absolute; top:46px; left:0; right:0; text-align:center; }
+.title { font-size:44px; font-weight:700; color:#e9c56b; letter-spacing:4px; }
+.sub { margin-top:10px; font-size:16px; color:#8fa6c8; letter-spacing:2px; }
+.grid { position:absolute; top:170px; left:70px; right:70px;
+  display:grid; grid-template-columns: repeat(5, 1fr); gap:18px; }
+.blk { position:relative; height:330px; padding:20px 18px;
+  background:linear-gradient(160deg, rgba(20,34,60,.92), rgba(10,18,34,.92));
+  border:1px solid rgba(212,175,55,.28); border-radius:14px; overflow:hidden; }
+.blk:before { content:""; position:absolute; inset:0;
+  background:radial-gradient(circle at 20% 0%, rgba(80,140,255,.18), transparent 60%); }
+.num { font-size:13px; color:#e9c56b; letter-spacing:2px; }
+.bt { margin-top:10px; font-size:21px; font-weight:700; color:#f3f7ff; }
+.bb { margin-top:12px; font-size:14px; line-height:1.75; color:#b7c8e4; }
+.chips { position:absolute; left:18px; right:18px; bottom:88px; display:flex; flex-wrap:wrap; gap:6px; }
+.chip { font-size:11px; padding:2px 8px; border-radius:10px; color:#9fc0ec;
+  background:rgba(70,120,200,.16); border:1px solid rgba(110,160,230,.28); }
+.bf { position:absolute; left:18px; right:18px; bottom:16px; font-size:12px;
+  line-height:1.6; color:#7f97ba; border-top:1px dashed rgba(120,160,220,.25); padding-top:10px; }
+</style></head><body><div class="stage">
+  <div class="head"><div class="title">硅基生命计划 · 架构总览</div>
+  <div class="sub">桌面陪伴型 AI 生命体 · 双人格 · 长期记忆 · 语音对话 · 本地推理</div></div>
+  <div class="grid">
+    <div class="blk">
+      <div class="num">01</div>
+      <div class="bt">双人格核心</div>
+      <div class="bb">小鱼 · 3B 软萌<br>小岚 · 7B 稳重</div>
+      <div class="chips"><span class="chip">3B</span><span class="chip">7B</span><span class="chip">音色</span><span class="chip">动画</span></div>
+      <div class="bf">模型 / 音色 / 记忆 / 动画 一起切</div>
+    </div>
+    <div class="blk">
+      <div class="num">02</div>
+      <div class="bt">语音输入</div>
+      <div class="bb">VAD 断句 · 流式草稿<br>SenseVoice 精修</div>
+      <div class="chips"><span class="chip">VAD</span><span class="chip">流式</span><span class="chip">SenseVoice</span><span class="chip">声纹</span></div>
+      <div class="bf">16 kHz · 声纹过滤 · 自定义词典</div>
+    </div>
+    <div class="blk">
+      <div class="num">03</div>
+      <div class="bt">语音输出</div>
+      <div class="bb">Fish 合成 · 按人格切音色<br>整篇拼接播放</div>
+      <div class="chips"><span class="chip">Fish</span><span class="chip">缓存</span><span class="chip">整篇拼接</span><span class="chip">音色</span></div>
+      <div class="bf">缓存命中直接播 · 失败不换引擎</div>
+    </div>
+    <div class="blk">
+      <div class="num">04</div>
+      <div class="bt">分层记忆</div>
+      <div class="bb">最近对话 · 向量检索<br>时间检索 · 每日印象</div>
+      <div class="chips"><span class="chip">对话</span><span class="chip">向量</span><span class="chip">时间</span><span class="chip">印象</span></div>
+      <div class="bf">说话人标记 · 重要性 · 召回次数</div>
+    </div>
+    <div class="blk">
+      <div class="num">05</div>
+      <div class="bt">记忆检索</div>
+      <div class="bb">语义 + 时间 + 重要性<br>+ 被想起次数</div>
+      <div class="chips"><span class="chip">语义</span><span class="chip">时间</span><span class="chip">权重</span><span class="chip">多样性</span></div>
+      <div class="bf">相对门槛 · 多样性选择</div>
+    </div>
+    <div class="blk">
+      <div class="num">06</div>
+      <div class="bt">长篇写作</div>
+      <div class="bb">日记 / 情书 / 故事<br>先写后念</div>
+      <div class="chips"><span class="chip">日记</span><span class="chip">情书</span><span class="chip">续写</span><span class="chip">去重</span></div>
+      <div class="bf">续写去重 · 字数补写 · 标题查重</div>
+    </div>
+    <div class="blk">
+      <div class="num">07</div>
+      <div class="bt">自我纠错</div>
+      <div class="bb">说完再校对<br>答非所问补一句</div>
+      <div class="chips"><span class="chip">答非所问</span><span class="chip">补丁</span><span class="chip">一次</span><span class="chip">校验</span></div>
+      <div class="bf">只补一次 · 必须带正确信息</div>
+    </div>
+    <div class="blk">
+      <div class="num">08</div>
+      <div class="bt">意图控制</div>
+      <div class="bb">切换 / 唱歌 / 算数<br>时间 / 年龄 / 称呼</div>
+      <div class="chips"><span class="chip">切换</span><span class="chip">唱歌</span><span class="chip">算数</span><span class="chip">称呼</span></div>
+      <div class="bf">代码前置拦截 · 不交给模型</div>
+    </div>
+    <div class="blk">
+      <div class="num">09</div>
+      <div class="bt">工程可靠性</div>
+      <div class="bb">单实例 · 看门狗<br>重启自证 · 每日快照</div>
+      <div class="chips"><span class="chip">单实例</span><span class="chip">看门狗</span><span class="chip">重启</span><span class="chip">快照</span></div>
+      <div class="bf">失败隔离 · 关键路径日志</div>
+    </div>
+    <div class="blk">
+      <div class="num">10</div>
+      <div class="bt">本地模型</div>
+      <div class="bb">Ollama：3B / 7B / bge-m3<br>SenseVoice · CAM++</div>
+      <div class="chips"><span class="chip">Ollama</span><span class="chip">bge-m3</span><span class="chip">CAM++</span><span class="chip">常驻</span></div>
+      <div class="bf">常驻内存 · 前缀缓存 99.6%</div>
+    </div></div>
+  <div class="footer">硅基生命计划 · 总览图 A / 概念总图</div>
+</div></body></html>

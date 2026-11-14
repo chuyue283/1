@@ -1,0 +1,96 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  width: 1600px; height: 1000px; overflow: hidden;
+  font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+  background: #050810; color: #e8eefc;
+}
+.stage { position: relative; width: 1600px; height: 1000px; }
+.footer {
+  position: absolute; left: 0; right: 0; bottom: 18px; text-align: center;
+  font-size: 13px; color: rgba(200,215,240,.45); letter-spacing: 2px;
+}
+
+body { background: radial-gradient(circle at 60% 45%, #0b1730 0%, #060b16 55%, #03060c 100%); }
+.title { position:absolute; top:46px; left:60px; font-size:38px; font-weight:700; color:#d8e7ff; letter-spacing:3px; }
+.sub { position:absolute; top:98px; left:62px; font-size:14px; color:#7f9bc4; letter-spacing:2px; }
+.filter { position:absolute; left:60px; top:160px; width:250px; height:720px; padding:18px;
+  background:rgba(8,16,32,.8); border:1px solid rgba(110,160,230,.25); border-radius:14px; }
+.fh { font-size:14px; color:#9fc0ec; letter-spacing:2px; margin-bottom:12px; }
+.row { display:flex; justify-content:space-between; font-size:13px; color:#c7d8f2; padding:7px 0;
+  border-bottom:1px dashed rgba(120,160,220,.14); }
+.row b { color:#e9c56b; font-weight:600; }
+svg { position:absolute; left:340px; top:140px; }
+.legend { position:absolute; right:60px; bottom:70px; font-size:12px; color:#8fa6c8; text-align:right; line-height:1.9; }
+</style></head><body><div class="stage">
+  <div class="title">关系网络 · 意识节点</div>
+  <div class="sub">人格、记忆、语音、工程之间的连接</div>
+  <div class="filter"><div class="fh">筛选 · FILTER</div>
+    <div class="row"><span>人格节点</span><b>2</b></div>
+    <div class="row"><span>记忆节点</span><b>614</b></div>
+    <div class="row"><span>语音节点</span><b>36</b></div>
+    <div class="row"><span>长篇节点</span><b>10</b></div>
+    <div class="row"><span>工程节点</span><b>18</b></div>
+    <div class="row"><span>模型节点</span><b>4</b></div>
+    <div class="row"><span>关系边</span><b>1,286</b></div>
+    <div class="row"><span>平均权重</span><b>0.62</b></div>
+    <div class="fh" style="margin-top:24px">类型</div>
+    <div class="row"><span>事实 / 偏好</span><b>189 / 96</b></div>
+    <div class="row"><span>规则 / 情绪</span><b>152 / 9</b></div>
+  </div>
+  <svg id="net" width="1220" height="800"></svg>
+  <div class="legend">节点大小 = 权重 · 线 = 关联<br>中心亮节点 = 原意识（小鱼 / 小岚）</div>
+  <div class="footer">硅基生命计划 · 总览图 C / 关系网络</div>
+</div>
+<script>
+const svg=document.getElementById('net');
+const NS='http://www.w3.org/2000/svg';
+let seed=11; function rnd(){ seed=(seed*16807)%2147483647; return seed/2147483647; }
+const cx=600, cy=390;
+const colors=['#5b9dff','#7fd0ff','#e9c56b','#9a8cff','#5be0c0'];
+const nodes=[];
+for(let i=0;i<120;i++){
+  const a=rnd()*6.283, r=Math.pow(rnd(),0.6)*400;
+  const z=(rnd()-0.5)*260;
+  const px=cx+Math.cos(a)*r*(1+z/1200), py=cy+Math.sin(a)*r*0.55*(1+z/1200);
+  nodes.push({x:px,y:py,z:z,w:rnd(),c:colors[i%colors.length]});
+}
+// 边
+for(let i=0;i<nodes.length;i++){
+  const a=nodes[i];
+  const near=nodes.map((b,j)=>({j,d:Math.hypot(a.x-b.x,a.y-b.y)})).filter(o=>o.j!==i).sort((p,q)=>p.d-q.d).slice(0,3);
+  near.forEach(o=>{
+    const b=nodes[o.j], l=document.createElementNS(NS,'line');
+    l.setAttribute('x1',a.x); l.setAttribute('y1',a.y); l.setAttribute('x2',b.x); l.setAttribute('y2',b.y);
+    l.setAttribute('stroke','rgba(90,150,255,.20)'); l.setAttribute('stroke-width','1'); svg.appendChild(l);
+  });
+}
+// 中心
+[[26,0.18],[16,0.3],[8,0.85]].forEach(([r,o])=>{
+  const c=document.createElementNS(NS,'circle');
+  c.setAttribute('cx',cx); c.setAttribute('cy',cy); c.setAttribute('r',r);
+  c.setAttribute('fill',`rgba(255,230,160,${o})`); svg.appendChild(c);
+});
+const t=document.createElementNS(NS,'text');
+t.setAttribute('x',cx); t.setAttribute('y',cy+46); t.setAttribute('text-anchor','middle');
+t.setAttribute('fill','#ffe9bd'); t.setAttribute('font-size','14'); t.textContent='原意识 · 小鱼 / 小岚';
+svg.appendChild(t);
+// 节点
+nodes.forEach(n=>{
+  const c=document.createElementNS(NS,'circle');
+  c.setAttribute('cx',n.x); c.setAttribute('cy',n.y); c.setAttribute('r',3.2+n.w*6.0);
+  c.setAttribute('fill',n.c); c.setAttribute('opacity',0.55+n.w*0.4);
+  svg.appendChild(c);
+});
+// 少量标签
+const labels=[['双人格','#e9c56b'],['语音链路','#5b9dff'],['长期记忆','#9a8cff'],['长篇写作','#5be0c0'],['工程运维','#7fd0ff']];
+labels.forEach(([s,c],i)=>{
+  const a=-1.15+i*0.58, r=330;
+  const tx=cx+Math.cos(a)*r, ty=cy+Math.sin(a)*r*0.55;
+  const g=document.createElementNS(NS,'text');
+  g.setAttribute('x',tx); g.setAttribute('y',ty); g.setAttribute('fill',c);
+  g.setAttribute('font-size','14'); g.setAttribute('text-anchor','middle');
+  g.textContent=s; svg.appendChild(g);
+});
+</script></body></html>

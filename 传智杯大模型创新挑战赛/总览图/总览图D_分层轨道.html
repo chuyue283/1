@@ -1,0 +1,90 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  width: 1600px; height: 1000px; overflow: hidden;
+  font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+  background: #050810; color: #e8eefc;
+}
+.stage { position: relative; width: 1600px; height: 1000px; }
+.footer {
+  position: absolute; left: 0; right: 0; bottom: 18px; text-align: center;
+  font-size: 13px; color: rgba(200,215,240,.45); letter-spacing: 2px;
+}
+
+body { background: radial-gradient(circle at 50% 46%, #0c1830 0%, #060b16 55%, #02040a 100%); }
+.title { position:absolute; top:44px; left:0; right:0; text-align:center; font-size:40px; font-weight:700;
+  color:#e6efff; letter-spacing:5px; }
+.sub { position:absolute; top:100px; left:0; right:0; text-align:center; font-size:14px; color:#7f9bc4; letter-spacing:3px; }
+svg { position:absolute; inset:0; }
+.orbit-label { font-size:15px; font-weight:700; letter-spacing:2px; }
+.orbit-sub { font-size:12px; fill:#8fa6c8; }
+.panellegend { position:absolute; left:56px; bottom:56px; width:360px; padding:14px 18px;
+  background:rgba(8,16,32,.62); border:1px solid rgba(110,160,230,.22); border-radius:12px; }
+.lg { display:flex; align-items:center; gap:8px; font-size:12px; color:#9fb4d4; padding:5px 0; }
+.lg i { width:8px; height:8px; border-radius:50%; display:inline-block; flex:0 0 8px; }
+.lg b { color:#dfe9fb; font-weight:600; width:52px; flex:0 0 52px; }
+.lg span { color:#8fa6c8; }
+.core-title { font-size:30px; font-weight:700; fill:#fff6dd; }
+.core-sub { font-size:13px; fill:#ffe9bd; letter-spacing:2px; }
+</style></head><body><div class="stage">
+  <div class="title">硅基生命计划 · 分层轨道</div>
+  <div class="sub">一个角色 · 四条能力轨道 · 从人格到工程</div>
+  <svg width="1600" height="1000" viewBox="0 0 1600 1000">
+    <defs>
+      <radialGradient id="coreG" cx="50%" cy="50%" r="50%">
+        <stop offset="0%" stop-color="#fff4cf" stop-opacity="0.95"/>
+        <stop offset="35%" stop-color="#ffd98a" stop-opacity="0.45"/>
+        <stop offset="100%" stop-color="#ffd98a" stop-opacity="0"/>
+      </radialGradient>
+      <linearGradient id="o1" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0%" stop-color="#e9c56b" stop-opacity=".15"/>
+        <stop offset="50%" stop-color="#e9c56b" stop-opacity=".7"/>
+        <stop offset="100%" stop-color="#e9c56b" stop-opacity=".15"/>
+      </linearGradient>
+      <linearGradient id="o2" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0%" stop-color="#5b9dff" stop-opacity=".12"/>
+        <stop offset="50%" stop-color="#5b9dff" stop-opacity=".65"/>
+        <stop offset="100%" stop-color="#5b9dff" stop-opacity=".12"/>
+      </linearGradient>
+      <linearGradient id="o3" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0%" stop-color="#9a8cff" stop-opacity=".12"/>
+        <stop offset="50%" stop-color="#9a8cff" stop-opacity=".6"/>
+        <stop offset="100%" stop-color="#9a8cff" stop-opacity=".12"/>
+      </linearGradient>
+      <linearGradient id="o4" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0%" stop-color="#5be0c0" stop-opacity=".12"/>
+        <stop offset="50%" stop-color="#5be0c0" stop-opacity=".55"/>
+        <stop offset="100%" stop-color="#5be0c0" stop-opacity=".12"/>
+      </linearGradient>
+      <filter id="glow"><feGaussianBlur stdDeviation="6" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    </defs>
+    <circle cx="800" cy="540" r="300" fill="url(#coreG)"/>
+    <!-- 四条轨道（椭圆） -->
+    <ellipse cx="800" cy="540" rx="250" ry="130" fill="none" stroke="url(#o1)" stroke-width="1.6"/>
+    <ellipse cx="800" cy="540" rx="390" ry="205" fill="none" stroke="url(#o2)" stroke-width="1.6"/>
+    <ellipse cx="800" cy="540" rx="530" ry="285" fill="none" stroke="url(#o3)" stroke-width="1.6"/>
+    <ellipse cx="800" cy="540" rx="670" ry="365" fill="none" stroke="url(#o4)" stroke-width="1.5"/>
+    <!-- 中心角色 -->
+    <circle cx="800" cy="540" r="92" fill="#0d1830" stroke="rgba(255,225,160,.55)" stroke-width="2"/>
+    <circle cx="800" cy="540" r="74" fill="rgba(255,220,150,.10)"/>
+    <text x="800" y="494" text-anchor="middle" class="core-title">小鱼 / 小岚</text>
+    <text x="800" y="528" text-anchor="middle" class="core-sub">双人格 · 同一个存在</text>
+    <!-- 轨道节点 -->
+    <g font-size="12" fill="#b7c8e4">
+      <circle cx="1050" cy="540" r="4" fill="#e9c56b"/><text x="1064" y="504">3B / 7B</text>
+      <circle cx="560" cy="540" r="4" fill="#5b9dff"/><text x="574" y="504">memory.jsonl</text>
+      <circle cx="1110" cy="385" r="4" fill="#9a8cff"/><text x="1124" y="389">voice-chat</text>
+      <circle cx="470" cy="730" r="4" fill="#5be0c0"/><text x="484" y="734">voice_daemon</text>
+      <circle cx="1310" cy="540" r="4" fill="#5b9dff"/><text x="1324" y="504">bge-m3</text>
+      <circle cx="800" cy="905" r="4" fill="#5be0c0"/><text x="814" y="909">watchdog</text>
+    </g>
+    <text x="800" y="940" text-anchor="middle" font-size="13" fill="rgba(200,215,240,.5)" letter-spacing="2">硅基生命计划 · 总览图 D / 分层轨道</text>
+  </svg>
+  <div class="panellegend">
+    <div class="lg"><i style="background:#e9c56b"></i><b>人格层</b><span>模型 · 音色 · 记忆可见性 · 开场白</span></div>
+    <div class="lg"><i style="background:#5b9dff"></i><b>记忆层</b><span>最近对话 · 向量 · 时间 · 每日印象</span></div>
+    <div class="lg"><i style="background:#9a8cff"></i><b>语音层</b><span>VAD · 流式识别 · 声纹 · 合成 · 播放</span></div>
+    <div class="lg"><i style="background:#5be0c0"></i><b>工程层</b><span>单实例 · 看门狗 · 重启 · 日志 · 备份</span></div>
+  </div>
+</div></body></html>

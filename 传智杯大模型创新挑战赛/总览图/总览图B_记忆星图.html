@@ -1,0 +1,100 @@
+<!doctype html><html><head><meta charset="utf-8"><style>
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  width: 1600px; height: 1000px; overflow: hidden;
+  font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
+  background: #050810; color: #e8eefc;
+}
+.stage { position: relative; width: 1600px; height: 1000px; }
+.footer {
+  position: absolute; left: 0; right: 0; bottom: 18px; text-align: center;
+  font-size: 13px; color: rgba(200,215,240,.45); letter-spacing: 2px;
+}
+
+body { background: radial-gradient(circle at 50% 52%, #0a1430 0%, #050a18 50%, #02040a 100%); }
+canvas { position:absolute; inset:0; }
+.title { position:absolute; top:52px; left:64px; font-size:40px; font-weight:700;
+  color:#cfe3ff; letter-spacing:3px; }
+.sub { position:absolute; top:108px; left:66px; font-size:15px; color:#7f9bc4; letter-spacing:2px; }
+.panel { position:absolute; top:170px; width:260px; padding:18px;
+  background:rgba(10,20,40,.72); border:1px solid rgba(110,160,230,.28);
+  border-radius:14px; backdrop-filter: blur(6px); }
+.left { left:60px; }
+.right { right:60px; width:300px; }
+.ph { font-size:15px; color:#9fc0ec; margin-bottom:12px; letter-spacing:1px; }
+.item { font-size:13px; color:#c7d8f2; line-height:1.9; }
+.item b { color:#e9c56b; font-weight:600; }
+.bar { height:5px; border-radius:3px; background:rgba(120,160,230,.18); margin:8px 0 14px; }
+.bar i { display:block; height:100%; border-radius:3px; background:linear-gradient(90deg,#4c8dff,#c9a24a); }
+.center { position:absolute; left:50%; top:52%; transform:translate(-50%,-50%);
+  width:420px; height:420px; border-radius:50%;
+  background:radial-gradient(circle, rgba(255,238,190,.95) 0%, rgba(255,210,120,.55) 18%,
+  rgba(90,150,255,.25) 42%, rgba(20,50,110,.05) 68%, transparent 72%);
+  filter: blur(2px); }
+.core { position:absolute; left:50%; top:52%; transform:translate(-50%,-50%); text-align:center; }
+.core .c1 { font-size:28px; font-weight:700; color:#fff3d6; text-shadow:0 0 24px rgba(255,220,150,.8); }
+.core .c2 { margin-top:8px; font-size:13px; color:#ffe9bd; letter-spacing:2px; }
+.card { position:absolute; right:66px; bottom:120px; width:340px; padding:20px;
+  background:linear-gradient(160deg, rgba(18,38,72,.95), rgba(8,16,32,.95));
+  border:1px solid rgba(212,175,55,.35); border-radius:16px; }
+.card .ct { font-size:17px; color:#f3e2b6; font-weight:700; }
+.card .cm { margin-top:8px; font-size:12px; color:#8fa6c8; }
+.card .cb { margin-top:12px; font-size:13px; line-height:1.8; color:#cfdcf0; }
+</style></head><body><div class="stage">
+  <canvas id="sky" width="1600" height="1000"></canvas>
+  <div class="title">记忆星图</div>
+  <div class="sub">每一条记忆是一颗星 · 越常被想起，越亮</div>
+  <div class="panel left"><div class="ph">记忆分类</div>
+    <div class="item">最近对话 <b>· 614 条</b></div><div class="bar"><i style="width:86%"></i></div>
+    <div class="item">长期记忆 <b>· 10 篇长篇</b></div><div class="bar"><i style="width:52%"></i></div>
+    <div class="item">人物与称呼 <b>· 24 条</b></div><div class="bar"><i style="width:34%"></i></div>
+    <div class="item">每日印象 <b>· 7 天</b></div><div class="bar"><i style="width:64%"></i></div>
+  </div>
+  <div class="center"></div>
+  <div class="core"><div class="c1">原意识 · 初</div><div class="c2">小鱼 / 小岚</div></div>
+  <div class="panel right"><div class="ph">最近被想起</div>
+    <div class="item">“写日记” → 《夏夜的灯》</div><div class="item">“头疼” → 主人说早点睡</div>
+    <div class="item">“叫老公” → 称呼约定</div><div class="item">“勇者故事” → 长篇存档</div>
+  </div>
+  <div class="card"><div class="ct">记忆卡片 · 2026.11.14</div>
+    <div class="cm">主人 · 对话 · 好感度 +2</div>
+    <div class="cb">她说“今天好冷”，我回了“靠过来”。<br>这条被想起 3 次，权重 0.78。</div></div>
+  <div class="footer">硅基生命计划 · 总览图 B / 记忆星图</div>
+</div>
+<script>
+const c=document.getElementById('sky'),x=c.getContext('2d');
+let seed=7; function rnd(){ seed=(seed*16807)%2147483647; return seed/2147483647; }
+function draw(){
+  x.clearRect(0,0,1600,1000);
+  const cx=800, cy=520;
+  // 旋臂星点
+  for(let i=0;i<9000;i++){
+    const arm=i%3, t=Math.pow(rnd(),0.55)*3.4;
+    const ang=t*2.4 + arm*2.094 + (rnd()-0.5)*0.55;
+    const r=40+t*210+(rnd()-0.5)*70;
+    const px=cx+Math.cos(ang)*r, py=cy+Math.sin(ang)*r*0.52;
+    const a=0.10+rnd()*0.55;
+    const size=rnd()<0.03?2.2:0.9;
+    x.fillStyle=`rgba(${180+Math.floor(rnd()*60)},${200+Math.floor(rnd()*40)},255,${a})`;
+    x.beginPath(); x.arc(px,py,size,0,6.283); x.fill();
+  }
+  // 亮星
+  for(let i=0;i<90;i++){
+    const ang=rnd()*6.283, r=60+rnd()*420;
+    const px=cx+Math.cos(ang)*r, py=cy+Math.sin(ang)*r*0.55;
+    x.shadowBlur=18; x.shadowColor='rgba(150,200,255,.9)';
+    x.fillStyle='rgba(230,242,255,.95)';
+    x.beginPath(); x.arc(px,py,1.8+rnd()*1.4,0,6.283); x.fill();
+  }
+  x.shadowBlur=0;
+  // 连线
+  x.strokeStyle='rgba(90,150,255,.16)'; x.lineWidth=1;
+  for(let i=0;i<36;i++){
+    const a=rnd()*6.283, d=120+rnd()*330;
+    x.beginPath(); x.moveTo(cx,cy);
+    x.lineTo(cx+Math.cos(a)*d, cy+Math.sin(a)*d*0.55); x.stroke();
+  }
+}
+draw();
+</script></body></html>
