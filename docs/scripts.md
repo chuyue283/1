@@ -13,8 +13,8 @@
 | `voice-chat.py` | **语音对话主程序**：监听麦克风 → Whisper 识别 → 发给桌宠 → 她回答 | 按 F9 开始/停止，Ctrl+F10 退出 |
 | `voice-chat.cmd` | 启动上面的程序（双击） | ✅ 常用 |
 | `start-voice.cmd` / `stop-voice.cmd` / `status-voice.cmd` | 启动 / 停止 / 看状态 | ✅ 常用 |
-| `voice-watchdog.py` | **看门狗**：voice-chat 挂了自动拉起 | 后台常驻 |
-| `voice-watchdog.ps1` | 旧版看门狗（PowerShell） | ⚠️ 已被 py 版替代 |
+| `voice-watchdog.py` | **健康监测**：voice-chat 挂了自动拉起 | 后台常驻 |
+| `voice-watchdog.ps1` | 旧版健康监测（PowerShell） | ⚠️ 已被 py 版替代 |
 | `voice-vad.json` | **音量阈值配置**：低于这个音量不算主人说话 | 改完重启 voice-chat |
 | `voicectl.ps1` | 语音总控（启动/停止/状态） | 内部调用 |
 | `toggle-speech.cmd` | 开关她的语音 | ✅ |
@@ -22,7 +22,7 @@
 | `voice-input.py` | 早期录音测试脚本 | ⚠️ |
 | `input-audio\` | **你说话**的录音（排查噪声用），每句一个 wav | 定期清理 |
 | `voice-chat.log` | 语音助手日志 | 看识别结果 |
-| `voice-chat.heartbeat` | 心跳文件（看门狗判断存活） | 自动生成 |
+| `voice-chat.heartbeat` | 心跳文件（健康监测判断存活） | 自动生成 |
 
 ---
 

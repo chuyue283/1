@@ -40,7 +40,7 @@ src/                本项目自己写的代码
   voice-chat.py       语音输入主程序（唤醒 / VAD / 流式识别 / 声纹 / 发送）
   voice_daemon.py     语音守护进程（TTS 合成 + 缓存 + 播放 + BGM）
   voice-enroll.py     声纹录入
-  voice-watchdog.py   看门狗
+  voice-watchdog.py   健康监测
   bgm.ps1             问候背景音乐播放器
   backup-config.ps1   每日配置/记忆快照
   start-ollama.ps1    开机拉起 Ollama（模型目录指向 D 盘）

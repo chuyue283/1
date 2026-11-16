@@ -63,6 +63,9 @@ _draft_last = None
 _draft_at = 0.0
 _stream_q = queue.Queue(maxsize=200)
 _stream_last_progress = 0.0
+_draft_buf = []
+_draft_owner = None
+_draft_checked_at = 0.0
 
 
 def init_stream_asr():
@@ -86,9 +89,12 @@ def init_stream_asr():
 
 
 def stream_reset():
-    global _stream, _draft_last, _stream_last_progress
+    global _stream, _draft_last, _stream_last_progress, _draft_buf, _draft_owner, _draft_checked_at
     _stream = None
     _draft_last = None
+    _draft_buf = []
+    _draft_owner = None
+    _draft_checked_at = 0.0
     _stream_last_progress = time.time()
     try:
         while True:
@@ -127,9 +133,26 @@ def stream_worker():
         try:
             stream_feed(samples)
             if _state["armed"] and _state["in_chat"]:
-                txt = stream_partial()
-                if txt:
-                    push_draft(txt)
+                # 先判断这段声音是不是主人，不是主人的话连草稿都不显示
+                try:
+                    global _draft_owner, _draft_checked_at
+                    now_ts = time.time()
+                    total = sum(len(x) for x in _draft_buf)
+                    if _draft_owner is not False and total >= int(1.2 * SR) and now_ts - _draft_checked_at > 0.8:
+                        _draft_checked_at = now_ts
+                        audio_all = np.concatenate(_draft_buf) if _draft_buf else np.zeros(0, dtype=np.float32)
+                        ok = speaker_ok(audio_all, quiet=True)
+                        if ok is False:
+                            _draft_owner = False
+                            push_draft("")
+                        elif ok is True:
+                            _draft_owner = True
+                except Exception:
+                    pass
+                if _draft_owner is not False:
+                    txt = stream_partial()
+                    if txt:
+                        push_draft(txt)
             _stream_last_progress = time.time()
         except Exception as _e:
             log("流式线程异常: " + str(_e)[:80])
@@ -144,6 +167,12 @@ def stream_feed(samples):
         if _stream is None:
             _stream = _stream_rec.create_stream()
         _stream.accept_waveform(SR, samples)
+        try:
+            _draft_buf.append(np.asarray(samples, dtype=np.float32).reshape(-1))
+            if len(_draft_buf) > 400:
+                _draft_buf = _draft_buf[-400:]
+        except Exception:
+            pass
         while _stream_rec.is_ready(_stream):
             _stream_rec.decode_stream(_stream)
     except Exception:
@@ -236,7 +265,7 @@ def _reload_profile_if_changed():
         pass
 
 
-def speaker_ok(audio):
+def speaker_ok(audio, quiet=False):
     """True=是主人；None=没法判断（放行）"""
     if _spk_ext is None:
         return None
@@ -249,7 +278,8 @@ def speaker_ok(audio):
     sim = speaker_similarity(audio)
     if sim is None:
         return None
-    log("声纹相似度 %.3f（阈值 %.2f）" % (sim, _spk_cfg["threshold"]))
+    if not quiet:
+        log("声纹相似度 %.3f（阈值 %.2f）" % (sim, _spk_cfg["threshold"]))
     return sim >= _spk_cfg["threshold"]
 
 
